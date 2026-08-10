@@ -169,6 +169,25 @@ pub fn build_prefix(tok: &Tokenizer, labels: &[&str]) -> Result<PromptPrefix, De
     })
 }
 
+/// The tokenizer's `[PAD]` id.
+///
+/// Asserted against the shipped tokenizer at load, like the other special ids —
+/// padding with the wrong token would not error, it would just quietly change
+/// what the encoder sees.
+pub const PAD_ID: i64 = 0;
+
+/// Pin the encoder input to a fixed size by right-padding.
+///
+/// Exists so a session built with ONNX Runtime dimension overrides gets inputs
+/// of exactly the size it was told to expect. Every document then costs what
+/// the *bucket* costs rather than what the document costs, which is the trade
+/// static shapes ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedShape {
+    pub seq_len: usize,
+    pub num_words: usize,
+}
+
 /// Per-document encoder input.
 #[derive(Debug, Default)]
 pub struct EncodedInput {
@@ -176,6 +195,10 @@ pub struct EncodedInput {
     pub attention_mask: Vec<i64>,
     /// Absolute position of each text word's first sub-token.
     pub text_word_indices: Vec<i64>,
+    /// Tokens before padding. Equals `input_ids.len()` when unpadded.
+    pub real_seq_len: usize,
+    /// Words before padding. Equals `text_word_indices.len()` when unpadded.
+    pub real_num_words: usize,
 }
 
 impl EncodedInput {
@@ -188,7 +211,8 @@ impl EncodedInput {
     }
 }
 
-/// Append the text words to the precomputed prefix.
+/// Append the text words to the precomputed prefix, optionally padding to
+/// `pad`.
 ///
 /// Buffers are reused across documents; the caller owns them.
 pub fn build_input(
@@ -196,6 +220,7 @@ pub fn build_input(
     words: &[Word],
     tok: &Tokenizer,
     cache: &mut WordIdCache,
+    pad: Option<FixedShape>,
     out: &mut EncodedInput,
 ) -> Result<(), DetectorError> {
     out.input_ids.clear();
@@ -226,8 +251,44 @@ pub fn build_input(
         }
     }
 
+    out.real_seq_len = out.input_ids.len();
+    out.real_num_words = out.text_word_indices.len();
+
     out.attention_mask.clear();
-    out.attention_mask.resize(out.input_ids.len(), 1);
+    out.attention_mask.resize(out.real_seq_len, 1);
+
+    if let Some(fixed) = pad {
+        // Overflow is an error, never a truncation. Silently dropping the tail
+        // of a document would make a DLP detector miss whatever was in it and
+        // report success, which is the worst failure this code could have.
+        if out.real_seq_len > fixed.seq_len {
+            return Err(DetectorError::inference(format!(
+                "document needs {} tokens but the session was built for {}; \
+                 use a larger bucket or split the document",
+                out.real_seq_len, fixed.seq_len
+            )));
+        }
+        if out.real_num_words > fixed.num_words {
+            return Err(DetectorError::inference(format!(
+                "document has {} words but the session was built for {}; \
+                 use a larger bucket or split the document",
+                out.real_num_words, fixed.num_words
+            )));
+        }
+
+        out.input_ids.resize(fixed.seq_len, PAD_ID);
+        // Zero mask over the pad region is the entire correctness argument for
+        // this feature; `tests/static_shapes.rs` checks that the graph honours
+        // it rather than assuming a traced export kept the mask at all.
+        out.attention_mask.resize(fixed.seq_len, 0);
+
+        // Pad words point at the *last real token*, never into the pad region
+        // and never into the schema prefix. Their `span_probs` rows come out as
+        // duplicates of the last real word's and are discarded by `decode`,
+        // which clamps `num_words` to `words.len()`.
+        out.text_word_indices.resize(fixed.num_words, last);
+    }
+
     Ok(())
 }
 
@@ -236,6 +297,134 @@ mod tests {
     use super::*;
     use crate::detectors::gliner2::test_support::{TOKENIZER_PATH, load_tokenizer, model_present};
     use crate::detectors::gliner2::words;
+
+    #[test]
+    fn pad_id_is_the_tokenizers_own_pad_token() {
+        // Padding with the wrong id would not error anywhere; it would just
+        // feed the encoder a different token and change the outputs slightly.
+        if !model_present() {
+            eprintln!("skipping: run scripts/fetch-models.sh");
+            return;
+        }
+        let tok = load_tokenizer();
+        assert_eq!(
+            tok.token_to_id("[PAD]").map(i64::from),
+            Some(PAD_ID),
+            "PAD_ID no longer matches the shipped tokenizer"
+        );
+    }
+
+    #[test]
+    fn padding_extends_the_input_without_disturbing_the_real_part() {
+        if !model_present() {
+            eprintln!("skipping: run scripts/fetch-models.sh");
+            return;
+        }
+        let tok = load_tokenizer();
+        let prefix = build_prefix(&tok, &["email", "person"]).unwrap();
+        let mut cache = WordIdCache::new(64);
+        let prepared = words::prepare("contact bob at bob@example.com");
+
+        let mut plain = EncodedInput::default();
+        build_input(&prefix, &prepared.words, &tok, &mut cache, None, &mut plain).unwrap();
+
+        let fixed = FixedShape {
+            seq_len: plain.seq_len() + 40,
+            num_words: plain.num_words() + 9,
+        };
+        let mut padded = EncodedInput::default();
+        build_input(
+            &prefix,
+            &prepared.words,
+            &tok,
+            &mut cache,
+            Some(fixed),
+            &mut padded,
+        )
+        .unwrap();
+
+        assert_eq!(padded.seq_len(), fixed.seq_len);
+        assert_eq!(padded.num_words(), fixed.num_words);
+        assert_eq!(padded.real_seq_len, plain.seq_len());
+        assert_eq!(padded.real_num_words, plain.num_words());
+
+        let real = plain.seq_len();
+        assert_eq!(
+            &padded.input_ids[..real],
+            &plain.input_ids[..],
+            "padding must not perturb the real tokens"
+        );
+        assert!(
+            padded.input_ids[real..].iter().all(|&v| v == PAD_ID),
+            "tail must be [PAD]"
+        );
+        assert!(
+            padded.attention_mask[..real].iter().all(|&v| v == 1)
+                && padded.attention_mask[real..].iter().all(|&v| v == 0),
+            "mask must be 1 over the real tokens and 0 over the pad"
+        );
+
+        // Every word index must address a real token — a pad-region index
+        // would gather a [PAD] embedding, and a prefix index would gather a
+        // schema token, both of which decode into plausible garbage.
+        let last_real = (real - 1) as i64;
+        assert!(
+            padded.text_word_indices.iter().all(|&i| i <= last_real),
+            "a word index points past the real tokens"
+        );
+        assert!(
+            padded.text_word_indices[plain.num_words()..]
+                .iter()
+                .all(|&i| i == last_real),
+            "pad words must all point at the last real token"
+        );
+    }
+
+    #[test]
+    fn a_document_too_large_for_its_bucket_errors_rather_than_truncating() {
+        if !model_present() {
+            eprintln!("skipping: run scripts/fetch-models.sh");
+            return;
+        }
+        let tok = load_tokenizer();
+        let prefix = build_prefix(&tok, &["email"]).unwrap();
+        let mut cache = WordIdCache::new(64);
+        let prepared = words::prepare("one two three four five six seven eight nine ten");
+        let mut enc = EncodedInput::default();
+
+        // Truncation here would silently drop the tail of a document, and a
+        // DLP detector that misses what it never saw reports success.
+        let err = build_input(
+            &prefix,
+            &prepared.words,
+            &tok,
+            &mut cache,
+            Some(FixedShape {
+                seq_len: 4,
+                num_words: 64,
+            }),
+            &mut enc,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("tokens"), "{err}");
+        assert!(err.contains("larger bucket"), "unhelpful error: {err}");
+
+        let err = build_input(
+            &prefix,
+            &prepared.words,
+            &tok,
+            &mut cache,
+            Some(FixedShape {
+                seq_len: 4096,
+                num_words: 2,
+            }),
+            &mut enc,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("words"), "{err}");
+    }
 
     #[test]
     fn special_token_ids_match_the_shipped_tokenizer() {
@@ -332,7 +521,7 @@ mod tests {
         let prepared = words::prepare("Contact John Smith at john@example.com");
         let mut cache = WordIdCache::new(1024);
         let mut enc = EncodedInput::default();
-        build_input(&prefix, &prepared.words, &tok, &mut cache, &mut enc).unwrap();
+        build_input(&prefix, &prepared.words, &tok, &mut cache, None, &mut enc).unwrap();
 
         assert_eq!(enc.num_words(), prepared.words.len());
         assert_eq!(enc.attention_mask.len(), enc.seq_len());
@@ -368,6 +557,7 @@ mod tests {
             &words::prepare("one").words,
             &tok,
             &mut cache,
+            None,
             &mut a,
         )
         .unwrap();
@@ -376,6 +566,7 @@ mod tests {
             &words::prepare("something else").words,
             &tok,
             &mut cache,
+            None,
             &mut b,
         )
         .unwrap();
@@ -423,7 +614,7 @@ mod tests {
             "emoji 👋 test",
         ] {
             let prepared = words::prepare(text);
-            build_input(&prefix, &prepared.words, &tok, &mut cache, &mut enc).unwrap();
+            build_input(&prefix, &prepared.words, &tok, &mut cache, None, &mut enc).unwrap();
             assert_eq!(
                 enc.num_words(),
                 prepared.words.len(),

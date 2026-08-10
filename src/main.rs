@@ -189,7 +189,7 @@ fn build_gliner1(a: &DetectorArgs) -> Result<dlp_bench::detectors::gliner1::Glin
         cfg.threshold = t;
     }
     cfg.verify_checksum = !a.skip_checksum;
-    cfg.provider = execution_provider(a);
+    cfg.session = session_options(a)?;
     if let Some(t) = a.threads {
         cfg.threads = ThreadConfig::with_intra(t);
     }
@@ -237,6 +237,144 @@ fn execution_provider(a: &DetectorArgs) -> dlp_bench::detectors::onnx::Execution
     }
 }
 
+/// Translate the CLI into a [`SessionOptions`], rejecting combinations that
+/// would silently measure something other than what was asked for.
+///
+/// Every check here exists because the alternative is a plausible-looking
+/// number: a `--coreml-*` flag under `--ep cpu` does nothing, a compute-plan
+/// request under NeuralNetwork produces an empty plan, and a profile without
+/// `ORT_LOG` set produces an empty file. All three read as findings.
+#[cfg(feature = "onnx")]
+fn session_options(a: &DetectorArgs) -> Result<dlp_bench::runtime::SessionOptions> {
+    use dlp_bench::runtime::{
+        CoreMlComputeUnits as U, CoreMlModelFormat as F, CoreMlOptions, CoreMlSpecialization as S,
+        DimOverride, OrtLogLevel, SessionOptions,
+    };
+
+    let r = &a.runtime;
+    let provider = execution_provider(a);
+
+    let touched_coreml = r.coreml_format.is_some()
+        || r.coreml_compute_units.is_some()
+        || r.coreml_subgraphs.is_some()
+        || r.coreml_static_shapes.is_some()
+        || r.coreml_specialization.is_some()
+        || r.coreml_profile
+        || r.coreml_cache_dir.is_some()
+        || r.coreml_fp16_accum.is_some();
+
+    if touched_coreml && !provider.is_coreml() {
+        return Err(Error::config(
+            "--coreml-* flags need --ep coreml or --ep coreml-ane; under --ep cpu \
+             they would be silently ignored and the result would be labelled cpu"
+                .to_owned(),
+        ));
+    }
+    if r.disable_cpu_fallback && !provider.is_coreml() {
+        return Err(Error::config(
+            "--disable-cpu-fallback under --ep cpu would refuse to place the graph \
+             on the only provider available"
+                .to_owned(),
+        ));
+    }
+
+    let coreml = provider.is_coreml().then(|| {
+        // Start from what the provider implies, so `--ep coreml-ane` plus an
+        // unrelated flag does not silently revert the compute units to All.
+        let base = SessionOptions::with_provider(provider)
+            .resolved_coreml()
+            .unwrap_or_default();
+        CoreMlOptions {
+            model_format: match r.coreml_format {
+                Some(cli::CoreMlFormatArg::NeuralNetwork) => F::NeuralNetwork,
+                Some(cli::CoreMlFormatArg::MlProgram) => F::MlProgram,
+                None => base.model_format,
+            },
+            compute_units: match r.coreml_compute_units {
+                Some(cli::CoreMlUnitsArg::All) => U::All,
+                Some(cli::CoreMlUnitsArg::CpuAne) => U::CpuAndNeuralEngine,
+                Some(cli::CoreMlUnitsArg::CpuGpu) => U::CpuAndGpu,
+                Some(cli::CoreMlUnitsArg::CpuOnly) => U::CpuOnly,
+                None => base.compute_units,
+            },
+            subgraphs: r.coreml_subgraphs.unwrap_or(base.subgraphs),
+            static_input_shapes: r.coreml_static_shapes.unwrap_or(base.static_input_shapes),
+            specialization: match r.coreml_specialization {
+                Some(cli::CoreMlSpecializationArg::Default) => S::Default,
+                Some(cli::CoreMlSpecializationArg::FastPrediction) => S::FastPrediction,
+                None => base.specialization,
+            },
+            profile_compute_plan: r.coreml_profile,
+            low_precision_accumulation_on_gpu: r
+                .coreml_fp16_accum
+                .unwrap_or(base.low_precision_accumulation_on_gpu),
+            model_cache_dir: r.coreml_cache_dir.clone(),
+        }
+    });
+
+    if r.coreml_profile && coreml.as_ref().map(|c| c.model_format) != Some(F::MlProgram) {
+        return Err(Error::config(
+            "--coreml-profile needs --coreml-format ml-program: Apple's MLComputePlan \
+             enumerates MLProgram operations and reports nothing for NeuralNetwork"
+                .to_owned(),
+        ));
+    }
+
+    // `ort` reads ORT_LOG once, when the environment is created on the first
+    // session build, and defaults to ERROR. Setting only the session level
+    // produces a session that would log and an environment that discards it.
+    if r.coreml_profile || r.ort_log.is_some() {
+        let env = std::env::var("ORT_LOG").unwrap_or_default();
+        if !matches!(env.as_str(), "info" | "verbose") {
+            return Err(Error::config(format!(
+                "ONNX Runtime discards log records below its environment severity, \
+                 which is {:?} here. Re-run with ORT_LOG=verbose in the environment.",
+                if env.is_empty() {
+                    "error (default)"
+                } else {
+                    &env
+                }
+            )));
+        }
+    }
+
+    let dimension_overrides: Vec<DimOverride> = r
+        .dim_override
+        .iter()
+        .map(|(name, size)| DimOverride {
+            name: name.clone(),
+            size: *size,
+        })
+        .collect();
+
+    // Only GLiNER2 knows how to pad its inputs to a fixed shape; for anything
+    // else an override turns every call into a shape-mismatch error at run
+    // time, which is a confusing way to learn the flag was unsupported.
+    if !dimension_overrides.is_empty() && a.detector != DetectorKind::Gliner2Pii {
+        return Err(Error::config(format!(
+            "--dim-override is only implemented for gliner2-pii; {} has no padding \
+             path and every call would fail on a shape mismatch",
+            a.detector.as_str()
+        )));
+    }
+
+    Ok(SessionOptions {
+        provider,
+        coreml,
+        disable_cpu_fallback: r.disable_cpu_fallback,
+        disable_intra_op_spinning: r.no_intra_op_spinning,
+        dimension_overrides,
+        log_level: r.ort_log.map(|l| match l {
+            cli::OrtLogArg::Error => OrtLogLevel::Error,
+            cli::OrtLogArg::Warning => OrtLogLevel::Warning,
+            cli::OrtLogArg::Info => OrtLogLevel::Info,
+            cli::OrtLogArg::Verbose => OrtLogLevel::Verbose,
+        }),
+        profile_json: r.ort_profile.clone(),
+        capture_ort_log: r.coreml_profile || r.ort_log.is_some(),
+    })
+}
+
 #[cfg(feature = "onnx")]
 fn build_token_class(
     a: &DetectorArgs,
@@ -259,7 +397,7 @@ fn build_token_class(
         cfg.threshold = t;
     }
     cfg.verify_checksum = !a.skip_checksum;
-    cfg.provider = execution_provider(a);
+    cfg.session = session_options(a)?;
     cfg.merge_adjacent = a.merge_adjacent;
     if let Some(t) = a.threads {
         cfg.threads = ThreadConfig::with_intra(t);
@@ -286,12 +424,51 @@ fn build_gliner2(a: &DetectorArgs) -> Result<dlp_bench::detectors::gliner2::Glin
     }
     cfg.schema = schema;
     cfg.verify_checksum = !a.skip_checksum;
-    cfg.provider = execution_provider(a);
+    cfg.session = session_options(a)?;
+    // Derived from the same overrides the session gets, so the two cannot
+    // disagree; `Gliner2Detector::load` re-checks and refuses if they do.
+    cfg.fixed_shape = fixed_shape(&cfg.session)?;
     if let Some(t) = a.threads {
         cfg.threads = ThreadConfig::with_intra(t);
     }
 
     Gliner2Detector::load(cfg).map_err(|source| Error::detector("gliner2-pii", source))
+}
+
+/// Turn `--dim-override seq_len=N --dim-override num_words=M` into the padding
+/// GLiNER2 must apply for a session built with those overrides.
+///
+/// Both or neither: a session pinned on one axis and variable on the other
+/// fails on every call, and the error would point at the graph rather than at
+/// the missing flag.
+#[cfg(feature = "onnx")]
+fn fixed_shape(
+    session: &dlp_bench::runtime::SessionOptions,
+) -> Result<Option<dlp_bench::detectors::gliner2::prompt::FixedShape>> {
+    use dlp_bench::detectors::gliner2::prompt::FixedShape;
+    match (
+        session.dimension_override("seq_len"),
+        session.dimension_override("num_words"),
+    ) {
+        (None, None) => Ok(None),
+        (Some(seq_len), Some(num_words)) => Ok(Some(FixedShape {
+            seq_len: seq_len as usize,
+            num_words: num_words as usize,
+        })),
+        (seq, _) => Err(Error::config(format!(
+            "static shapes need both axes pinned: --dim-override {} is set but {} is not",
+            if seq.is_some() {
+                "seq_len"
+            } else {
+                "num_words"
+            },
+            if seq.is_some() {
+                "num_words"
+            } else {
+                "seq_len"
+            },
+        ))),
+    }
 }
 
 /// Canonical types a detector's schema can produce, for `--restrict-to-supported`.
@@ -427,6 +604,7 @@ fn cmd_perf(cli: &Cli, a: &cli::PerfArgs) -> Result<()> {
         warmup: a.warmup,
         thread_counts: a.thread_counts.clone(),
         measure_throughput: !a.thread_counts.is_empty(),
+        stage_timing: a.stage_timing,
     };
 
     let warmup_text = perf::synthetic_document(32);
@@ -448,6 +626,22 @@ fn cmd_perf(cli: &Cli, a: &cli::PerfArgs) -> Result<()> {
     let buckets = perf::measure_latency(detector.as_ref(), &cfg).map_err(to_err)?;
     let warm_rss = perf::memory::snapshot();
 
+    // Second pass, after the headline numbers are already banked, so the
+    // timers cannot influence them. Refuse rather than print zeros: a
+    // breakdown of all-zero stages reads as "these are free".
+    let stage_breakdown = if cfg.stage_timing {
+        if !detector.supports_stage_timing() {
+            return Err(Error::config(format!(
+                "{} does not implement stage timing; --stage-timing would report \
+                 zeros for every stage. Supported today: gliner2-pii.",
+                name
+            )));
+        }
+        perf::measure_stages(detector.as_ref(), &cfg).map_err(to_err)?
+    } else {
+        Vec::new()
+    };
+
     let throughput = if cfg.measure_throughput {
         perf::measure_throughput(&|| build_one(&a.detector), &cfg, a.throughput_docs)
             .map_err(|source| Error::detector(name.clone(), source))?
@@ -456,6 +650,9 @@ fn cmd_perf(cli: &Cli, a: &cli::PerfArgs) -> Result<()> {
     };
 
     let schema_prefix_tokens = detector.fixed_prompt_tokens();
+    // Last, because it flushes ONNX Runtime's node profile: anything measured
+    // after this point would not appear in the EP breakdown.
+    let runtime = detector.runtime_info();
 
     let mut report = Report {
         run: RunMeta::capture(cli.seed),
@@ -465,8 +662,10 @@ fn cmd_perf(cli: &Cli, a: &cli::PerfArgs) -> Result<()> {
             detector: name,
             model_size_bytes: detector.model_size_bytes(),
             schema_prefix_tokens,
+            runtime,
             cold_start,
             buckets,
+            stage_breakdown,
             throughput,
             warm_rss,
             peak_rss: perf::memory::snapshot(),
@@ -611,6 +810,31 @@ fn cmd_inspect(_cli: &Cli, a: &cli::InspectArgs) -> Result<()> {
         )
         .ok();
         writeln!(w, "  prefix      {} tokens per call", g.prefix_tokens()).ok();
+
+        // Encoder sizes at each perf bucket, so a static-shape run can be sized
+        // from measured sub-token counts instead of a guessed words-to-pieces
+        // ratio. Rounded up to the next multiple of 32 for headroom, and
+        // printed in the exact form `--dim-override` takes.
+        writeln!(w, "  bucket shapes (for --dim-override):").ok();
+        for &n in dlp_bench::perf::DEFAULT_BUCKETS {
+            let doc = dlp_bench::perf::synthetic_document(n);
+            match g.encoded_size(&doc) {
+                Ok((seq, words)) => {
+                    let round = |v: usize| v.div_ceil(32) * 32;
+                    writeln!(
+                        w,
+                        "    {n:>5} words -> {seq:>5} tokens, {words:>4} words   \
+                         --dim-override seq_len={} --dim-override num_words={}",
+                        round(seq),
+                        round(words)
+                    )
+                    .ok();
+                }
+                Err(e) => {
+                    writeln!(w, "    {n:>5} words -> error: {e}").ok();
+                }
+            }
+        }
         writeln!(w, "  graph:\n{}", g.describe_graph()).ok();
     }
 

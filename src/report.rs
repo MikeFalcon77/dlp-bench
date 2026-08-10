@@ -403,6 +403,89 @@ fn print_quality(w: &mut impl Write, e: &Evaluation) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Print the per-stage attribution, if `--stage-timing` produced one.
+///
+/// Two rows per bucket, p50 and p95, because "which stage owns the median" and
+/// "which stage owns the tail" are different questions and for a synchronous
+/// DLP hook the second is the one that decides whether a user notices.
+///
+/// The `wall` column is the instrumented pass, not the headline pass above.
+/// Printing both is what makes the instrumentation cost visible rather than
+/// assumed — if they diverge, the breakdown describes a run nobody cares about.
+fn print_stage_breakdown(w: &mut impl Write, p: &PerfReport) -> std::io::Result<()> {
+    use crate::stages::Stage;
+
+    if p.stage_breakdown.is_empty() {
+        return Ok(());
+    }
+
+    writeln!(
+        w,
+        "\n  stage breakdown (instrumented pass; the latency above is uninstrumented):"
+    )?;
+    write!(w, "    {:>7} {:>4}", "tokens", "")?;
+    for s in Stage::ALL {
+        write!(w, " {:>12}", s.short())?;
+    }
+    writeln!(w, " {:>9} {:>9}", "unattr", "wall")?;
+
+    for b in &p.stage_breakdown {
+        let get = |s: Stage| {
+            b.stages
+                .iter()
+                .find(|x| x.stage == s)
+                .map_or(0.0, |x| x.percentiles.p50_ms)
+        };
+        write!(w, "    {:>7} {:>4}", b.target_tokens, "p50")?;
+        for s in Stage::ALL {
+            write!(w, " {:>12.2}", get(s))?;
+        }
+        writeln!(
+            w,
+            " {:>9.2} {:>9.2}",
+            b.unattributed_p50_ms, b.instrumented.p50_ms
+        )?;
+
+        let get95 = |s: Stage| {
+            b.stages
+                .iter()
+                .find(|x| x.stage == s)
+                .map_or(0.0, |x| x.percentiles.p95_ms)
+        };
+        write!(w, "    {:>7} {:>4}", "", "p95")?;
+        for s in Stage::ALL {
+            write!(w, " {:>12.2}", get95(s))?;
+        }
+        writeln!(w, " {:>9} {:>9.2}", "-", b.instrumented.p95_ms)?;
+    }
+
+    // The headline claim this table exists to settle, stated rather than left
+    // for the reader to compute from six columns.
+    if let Some(b) = p
+        .stage_breakdown
+        .iter()
+        .find(|b| b.target_tokens == 128)
+        .or_else(|| p.stage_breakdown.first())
+        && let Some(run) = b.stages.iter().find(|s| s.stage == Stage::SessionRun)
+    {
+        let copies: f64 = b
+            .stages
+            .iter()
+            .filter(|s| matches!(s.stage, Stage::InputCopy | Stage::OutputCopy))
+            .map(|s| s.share_of_p50)
+            .sum();
+        writeln!(
+            w,
+            "    at {} tokens: session.run {:.1}% of wall, tensor copies {:.1}%",
+            b.target_tokens,
+            run.share_of_p50 * 100.0,
+            copies * 100.0
+        )?;
+    }
+
+    Ok(())
+}
+
 fn print_perf(w: &mut impl Write, p: &PerfReport) -> std::io::Result<()> {
     writeln!(w, "\nPERFORMANCE  detector={}", p.detector)?;
     if let Some(sz) = p.model_size_bytes {
@@ -418,6 +501,75 @@ fn print_perf(w: &mut impl Write, p: &PerfReport) -> std::io::Result<()> {
             "  schema prefix         {pref} tokens re-encoded on every call"
         )?;
     }
+    if let Some(rt) = &p.runtime {
+        write!(
+            w,
+            "  runtime               {} · intra_op {} · inter_op {} · {}",
+            rt.provider, rt.intra_op_threads, rt.inter_op_threads, rt.graph_optimization
+        )?;
+        if let Some(c) = rt.session.resolved_coreml() {
+            write!(
+                w,
+                " · coreml {}/{}{}{}",
+                c.model_format.as_str(),
+                c.compute_units.as_str(),
+                if c.subgraphs { " +subgraphs" } else { "" },
+                if c.static_input_shapes {
+                    " +static-shapes"
+                } else {
+                    ""
+                }
+            )?;
+        }
+        if !rt.session.dimension_overrides.is_empty() {
+            let dims: Vec<String> = rt
+                .session
+                .dimension_overrides
+                .iter()
+                .map(|d| format!("{}={}", d.name, d.size))
+                .collect();
+            write!(w, " · fixed {}", dims.join(","))?;
+        }
+        writeln!(w)?;
+
+        // The number that decides whether a CoreML measurement is a
+        // measurement of CoreML at all.
+        if let Some(share) = &rt.ep_node_share {
+            writeln!(
+                w,
+                "  accelerated           {:.1}% of kernel time off the CPU EP",
+                share.accelerated_fraction() * 100.0
+            )?;
+            for (provider, us) in &share.by_provider_us {
+                let pct = if share.total_us > 0 {
+                    *us as f64 / share.total_us as f64 * 100.0
+                } else {
+                    0.0
+                };
+                writeln!(
+                    w,
+                    "      {provider:<28} {:>8.1} ms  {:>5.1}%  {} nodes",
+                    *us as f64 / 1000.0,
+                    pct,
+                    share.nodes.get(provider).copied().unwrap_or(0)
+                )?;
+            }
+        }
+        if !rt.coreml_compute_plan.is_empty() {
+            let mut by_device: std::collections::BTreeMap<&str, usize> = Default::default();
+            for e in &rt.coreml_compute_plan {
+                *by_device.entry(e.device.as_str()).or_default() += 1;
+            }
+            let summary: Vec<String> = by_device.iter().map(|(d, n)| format!("{d} {n}")).collect();
+            writeln!(
+                w,
+                "  coreml compute plan   {} ops — {}",
+                rt.coreml_compute_plan.len(),
+                summary.join(", ")
+            )?;
+        }
+    }
+
     let cs = &p.cold_start;
     writeln!(w, "  model load            {:.0} ms", cs.model_load_ms)?;
     writeln!(w, "  first inference       {:.1} ms", cs.first_inference_ms)?;
@@ -457,6 +609,8 @@ fn print_perf(w: &mut impl Write, p: &PerfReport) -> std::io::Result<()> {
             b.docs_per_sec_p50
         )?;
     }
+
+    print_stage_breakdown(w, p)?;
 
     if !p.throughput.is_empty() {
         writeln!(w, "\n  throughput (independent detector per thread):")?;
@@ -556,6 +710,7 @@ mod tests {
             detector: "t".into(),
             model_size_bytes: Some(1024),
             schema_prefix_tokens: Some(77),
+            runtime: None,
             cold_start: ColdStart {
                 model_load_ms: cold_ms - 10.0,
                 first_inference_ms: 10.0,
@@ -573,6 +728,7 @@ mod tests {
                 },
                 docs_per_sec_p50: 0.0,
             }],
+            stage_breakdown: vec![],
             throughput: vec![],
             warm_rss: None,
             peak_rss: None,

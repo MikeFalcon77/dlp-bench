@@ -28,7 +28,9 @@ pub mod labels;
 pub mod perf;
 pub mod report;
 pub mod runmeta;
+pub mod runtime;
 pub mod span;
+pub mod stages;
 
 pub use detector::{ArtifactInfo, Detector};
 pub use entity::{Detection, DetectionSource, EntityType};

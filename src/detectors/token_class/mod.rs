@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use tokenizers::Tokenizer;
 
-use super::onnx::{ExecutionProviderChoice, GraphContract, GraphInput, OrtGraph, ThreadConfig};
+use super::onnx::{GraphContract, GraphInput, OrtGraph, SessionOptions, ThreadConfig};
 use crate::detector::{ArtifactInfo, Detector, finish};
 use crate::entity::{Detection, DetectionSource};
 use crate::error::DetectorError;
@@ -205,7 +205,8 @@ pub struct TokenClassConfig {
     pub precision: Option<Precision>,
     pub threshold: f32,
     pub threads: ThreadConfig,
-    pub provider: ExecutionProviderChoice,
+    /// How the ONNX Runtime session is built. Defaults to the CPU baseline.
+    pub session: SessionOptions,
     pub verify_checksum: bool,
     pub chunk_tokens: usize,
     pub chunk_overlap: usize,
@@ -222,7 +223,7 @@ impl TokenClassConfig {
             precision: None,
             threshold: 0.5,
             threads: ThreadConfig::default(),
-            provider: ExecutionProviderChoice::default(),
+            session: SessionOptions::default(),
             verify_checksum: true,
             chunk_tokens: DEFAULT_CHUNK_TOKENS,
             chunk_overlap: DEFAULT_CHUNK_OVERLAP,
@@ -314,11 +315,11 @@ impl TokenClassDetector {
         let _ = tokenizer.with_truncation(None);
         tokenizer.with_padding(None);
 
-        let graph = OrtGraph::load_with(
+        let graph = OrtGraph::load_with_options(
             &model_path,
             &config.model.contract,
             config.threads,
-            config.provider,
+            &config.session,
         )?;
 
         let name = if config.model.variants.len() > 1 {
@@ -616,6 +617,10 @@ impl Detector for TokenClassDetector {
 
     fn model_size_bytes(&self) -> Option<u64> {
         Some(self.variant.size_bytes)
+    }
+
+    fn runtime_info(&self) -> Option<crate::runtime::RuntimeInfo> {
+        Some(self.inner.lock().ok()?.graph.runtime_info())
     }
 
     /// None: this is the point of the comparison. A token classifier pays no

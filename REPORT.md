@@ -240,6 +240,9 @@ Options, roughly in order of robustness:
    monitoring, input capture. Broadest reach, most fragile, most invasive, and
    the most likely to break on every application update.
 
+**Note:** see §5.3 for evidence that per-app DOM injection is a losing bet — the
+one vendor we can inspect built it and then removed it.
+
 **Recommendation:** treat this as a portfolio. Extensions for browsers and
 VS Code-family editors cover the bulk at acceptable cost; a local proxy covers
 desktop and CLI clients; a hooks-based agent is a last resort for named
@@ -252,6 +255,186 @@ with no dependency on the evaluation code — they are meant to be lifted into
 these hosts unchanged.
 
 ---
+
+
+### 5.3 How Nightfall actually solves the latency problem — they avoid it
+
+Read from the shipped extension itself (`Nightfall DLP for Browsers` v8.15.0,
+Chrome Web Store id `jgmgecncmjklkabkejnjfgfkglapfgek`; it ships source maps
+with `sourcesContent`, so the original TypeScript is recoverable). Their
+documentation does not describe this; the code does.
+
+**The extension is a sensor and an enforcement point. It contains no detector.**
+It talks to a *local endpoint agent* over `ws://localhost:<port>` (with a
+`wss://` fallback) plus `nativeMessaging`. The whole agent protocol is two
+request types: `CLIPBOARD_PERMISSION` and `FILE_UPLOAD_PERMISSION`.
+
+**For pasted text they never inspect the content in the decision path at all.**
+The permission request carries only `{domain, url, title, userEmail}` — *where
+you are and who you are*, not *what you are pasting*. The paste handler is
+fully synchronous and reads a cached boolean:
+
+```ts
+doc.addEventListener("paste", event => {
+  const pasteContent = event.clipboardData?.getData("text") ?? "";
+  if (!allowPaste) {                    // pre-computed, never awaited
+    event.preventDefault();
+    event.stopPropagation();
+    sendClipboardEvent("paste", pasteContent, { blocked: true, ... });
+  } else {
+    sendClipboardEvent("paste", pasteContent, { blocked: false, ... });
+  }
+}, true);
+```
+
+`allowPaste` is refreshed ahead of time — on init, `visibilitychange`, `focus`,
+`pageshow` and SPA URL changes — so by the time the user pastes, the answer is
+already in a variable. The content *is* shipped to the agent, but by
+`sendClipboardEvent`, fire-and-forget, **after** the decision. That is
+detection-and-alerting, not prevention.
+
+So the honest description of their text path is: **coarse policy prevention,
+fine-grained detection after the fact.** They dodge our entire latency problem
+by not asking a content question on the hot path.
+
+**For file uploads they do ask a content question**, and the pattern there is
+worth stealing — *swallow and replay*:
+
+1. capture the `drop` / `paste` / `change` event and `preventDefault()` it;
+2. request a verdict from the agent;
+3. if allowed, dispatch a **synthetic event with the original files** so the page
+   proceeds as if nothing happened (`replayedEvents` is a `WeakSet` so their own
+   capture-phase listener ignores the replay).
+
+This converts a blocking decision into an asynchronous one without the user
+losing the action. It is also fragile in exactly the way one would expect —
+folder drag-and-drop is explicitly unsupported because "a synthetic
+DataTransfer can't reconstruct FileSystemDirectoryEntry".
+
+**Everything fails open, on a 3-second floor.** Both paths use
+`CLIPBOARD_PERMISSION_TIMEOUT_MS = 3000` / `UPLOAD_VERDICT_TIMEOUT_MS = 3_000`,
+and both default to *allow*:
+
+```ts
+export const DEFAULT_ALLOWED_PASTE_PERMISSION = true;
+```
+
+Their own comment on the upload path is the important part: *"The agent replies
+promptly — it never long-holds (scan-pending uploads are blocked immediately
+with a 'scanning' notification rather than waiting)."* When the scan is not
+finished, the agent **blocks and tells the user it is scanning** rather than
+making them wait. That is a third option we had not considered alongside
+"block-and-wait" and "allow-and-warn-later", and it is probably the right
+default for a slow detector: *deny with an explanation, let the user retry.*
+
+Two further details that show how fragile DOM interception is in practice, and
+that we should budget for:
+
+- Copilot surfaces (`copilot.microsoft.com`, `copilot.com`, `copilot.fun`)
+  swallow Ctrl+V at `keydown`, so the normal `paste` event never fires and they
+  need a separate keydown-capture blocker — Edge-only.
+- `claude.ai` needs a **MAIN-world** injected script to capture the user's email
+  from a Segment `identify` call, with a DOM-menu-clicking fallback that
+  synthesises `pointerdown` + `click` on a Radix dropdown. That is per-site
+  reverse engineering that breaks on redesign.
+
+**What this means for us.** Their design is a legitimate answer to the latency
+problem, but it is a *weaker security posture* than the one we have been
+scoping: a domain/user policy cannot tell a prompt containing an AWS key from a
+prompt asking about the weather. Our measured Tier 0 changes the trade: at
+0.1 ms and 12 MB, validated regex is fast enough to make a **content-aware**
+allow/deny decision inline, which their architecture cannot do. The right
+synthesis is:
+
+| | Nightfall (observed) | proposed here |
+|---|---|---|
+| hot-path decision | policy on (domain, user) | **content-aware** Tier 0 rules, 0.1 ms |
+| content inspection | asynchronous, after the fact | Tier 0 inline + Tier 1 asynchronous |
+| slow-scan behaviour | block with "scanning" notice | same — adopt this |
+| timeout | 3 s, fail open | same floor; fail-open is a policy choice, not a default |
+| detector location | local agent over localhost WS | same |
+
+The "block with a scanning notice" pattern and the swallow-and-replay mechanism
+should both be adopted. The policy-only text path should not.
+
+
+#### They built per-app injection, shipped it, and are removing it
+
+This is the most consequential thing in the extension, because it is a direct
+verdict on the "inject into ChatGPT / Cursor specifically" idea.
+
+The extension **does** recognise AI sites — but only to answer *who the user
+is*, never *whether to block*. `aiAppsAccount.js` is injected on
+`*.chatgpt.com`, `claude.ai` and `*.perplexity.ai` purely to scrape the account
+email (from ChatGPT's `client-bootstrap` JSON, from a Claude Segment
+`identify` call intercepted in the MAIN world, from Perplexity's
+`localStorage`). The site list is named for what it is:
+
+```ts
+/** The set of sites the extension extracts user identity (account email) from. */
+export const ACCOUNT_DETECTION_MATCH_PATTERNS: string[] = [ ... ];
+```
+
+The blocking decision has no site awareness at all: `ClipboardMonitor` runs on
+`<all_urls>` and asks the agent about `{domain, url, title, userEmail}`.
+
+But an **earlier architecture did exactly what we proposed**. Dead code in
+`constant.ts` shows a `TextMonitor` that hooked the composer of nine named
+applications:
+
+```ts
+// export const InputQuerySelectors: Record<GENAI_APPS, string> = {
+//   [GENAI_APPS.CHATGPT]:    "#prompt-textarea",
+//   [GENAI_APPS.CLAUDE]:     'div[contenteditable="true"]',
+//   [GENAI_APPS.GEMINI]:     '[contenteditable="true"][role="textbox"]:not([data-placeholder^="Example"])',
+//   [GENAI_APPS.DEEPSEEK]:   "textarea[id='chat-input']",
+//   [GENAI_APPS.PERPLEXITY]: "#ask-input, textarea[placeholder^='Ask'], textarea[placeholder='Research anything…']",
+//   [GENAI_APPS.GROK]:       "textarea[dir='auto']",
+//   ...
+// };
+// export const SubmitQuerySelectors: Record<GENAI_APPS, string> = { ... };
+// export const GenAIAppConfig = {
+//   [GENAI_APPS.CHATGPT]: { submitSelector: "button", textBoxRemoval: true },
+//   [GENAI_APPS.CLAUDE]:  { submitSelector: "button", textBoxRemoval: true, donotShowModal: true },
+//   ...
+// };
+```
+
+That is composer interception with a per-app send-button hook and even
+`textBoxRemoval` — clearing the user's input on a violation. There was a
+matching `MessageType.SCAN` / `CREATE_VIOLATION` protocol and a
+`ScanMessageSenderResponse` type: a real scan-the-text path.
+
+**It is gone from the shipped bundle.** `grep` for `prompt-textarea`,
+`TextMonitor` or `InputQuerySelectors` in the built JavaScript returns zero
+matches; only dead type declarations survive in source, every one tagged
+`// TODO: Remove ... once TextMonitor removal is confirmed`.
+
+The reason is legible in the selectors themselves. `textarea[placeholder=
+'Research anything…']` keys off a **localised UI string**. `div._7436101[role=
+button]` keys off a **hashed CSS class**. These break on any redesign, any copy
+change, any non-English locale — for nine applications that ship continuously.
+They replaced a per-app surface that rots with an app-agnostic one
+(clipboard + upload) that does not.
+
+**Implication for our plan.** The report's §5.2 proposal to "inject into ChatGPT
+and Cursor specifically" should be **demoted**. A vendor with a dedicated team
+tried it, shipped it, and retreated to clipboard/upload interception. Our
+sequencing should be:
+
+1. **App-agnostic interception first** — clipboard and upload on `<all_urls>`.
+   One implementation, no per-site maintenance, covers every AI app including
+   ones that do not exist yet.
+2. **IDE extensions second** (VS Code / Cursor), because those are *supported
+   APIs* rather than scraped DOM, and so do not carry the rot.
+3. **Per-app DOM injection last, and only where a named customer demands it**,
+   with the maintenance cost stated up front.
+
+The gap this leaves is honest and worth stating: clipboard interception does not
+see **typed** text. Someone who types a password character by character is not
+blocked. For AI-DLP that is a tolerable trade — secrets and configs arrive by
+paste, essentially always — but it is a real hole, and it is the hole Nightfall
+chose to accept rather than keep paying the per-app maintenance bill.
 
 ## 6. Recommended architecture
 

@@ -142,6 +142,40 @@ pub enum EpArg {
     CoremlAne,
 }
 
+/// CoreML model representation.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreMlFormatArg {
+    /// CoreML 3. The default, and the only format measured so far.
+    NeuralNetwork,
+    /// CoreML 5. More operators, and the only format Apple's compute-plan
+    /// profiler can introspect.
+    MlProgram,
+}
+
+/// Hardware CoreML may schedule onto.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreMlUnitsArg {
+    All,
+    CpuAne,
+    CpuGpu,
+    CpuOnly,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreMlSpecializationArg {
+    Default,
+    /// Trade session-load time and memory for prediction latency.
+    FastPrediction,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OrtLogArg {
+    Error,
+    Warning,
+    Info,
+    Verbose,
+}
+
 /// Numeric precision of the weight file to load.
 ///
 /// Explicit because it is a first-class benchmark axis: the GLiNER models ship
@@ -212,6 +246,104 @@ pub struct DetectorArgs {
     /// merging one gold entity is matched once and counted against N-1 times.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub merge_adjacent: bool,
+
+    #[command(flatten)]
+    pub runtime: RuntimeArgs,
+}
+
+/// ONNX Runtime session knobs.
+///
+/// Flattened into [`DetectorArgs`] rather than into `perf` alone, because the
+/// static-shape correctness gate runs `evaluate` under the same session
+/// configuration as the latency measurement — if these lived on `perf` only,
+/// the two could not be compared.
+///
+/// Every one of these defaults to "leave it alone", so a command that sets none
+/// of them builds exactly the session the benchmark has always built.
+#[derive(clap::Args, Debug, Clone)]
+#[command(next_help_heading = "ONNX Runtime")]
+pub struct RuntimeArgs {
+    /// CoreML model format. MLProgram is untested on the GLiNER2 graph.
+    #[arg(long, value_enum)]
+    pub coreml_format: Option<CoreMlFormatArg>,
+
+    /// Hardware CoreML may use. Overrides what `--ep` implies.
+    #[arg(long, value_enum)]
+    pub coreml_compute_units: Option<CoreMlUnitsArg>,
+
+    /// Compile CoreML subgraphs inside Loop/Scan/If bodies.
+    ///
+    /// Not main-graph partitioning, which is unconditional. This was turned on
+    /// at the same time as MLProgram when the graph last broke, so neither has
+    /// been tested alone.
+    #[arg(long)]
+    pub coreml_subgraphs: Option<bool>,
+
+    /// Only let CoreML claim nodes whose inputs have static shapes.
+    ///
+    /// Restrictive on its own — pair it with `--dim-override`.
+    #[arg(long)]
+    pub coreml_static_shapes: Option<bool>,
+
+    #[arg(long, value_enum)]
+    pub coreml_specialization: Option<CoreMlSpecializationArg>,
+
+    /// Log which hardware each CoreML operator ran on.
+    ///
+    /// Requires `--coreml-format ml-program`: Apple's compute-plan API
+    /// enumerates MLProgram operations and reports nothing for NeuralNetwork.
+    #[arg(long)]
+    pub coreml_profile: bool,
+
+    /// Reuse the compiled CoreML model across runs, instead of recompiling the
+    /// 426 MB graph on every process start.
+    #[arg(long)]
+    pub coreml_cache_dir: Option<PathBuf>,
+
+    /// Allow fp16 accumulation on the GPU.
+    #[arg(long)]
+    pub coreml_fp16_accum: Option<bool>,
+
+    /// Fail to build unless the graph places entirely on the accelerator.
+    ///
+    /// A diagnostic, not an optimisation: the error names the nodes CoreML
+    /// could not take, which is the question `--ep coreml` cannot answer.
+    #[arg(long)]
+    pub disable_cpu_fallback: bool,
+
+    /// Turn off ONNX Runtime's intra-op spin-wait.
+    #[arg(long)]
+    pub no_intra_op_spinning: bool,
+
+    /// Write ONNX Runtime's per-node profile here and summarise kernel time by
+    /// execution provider in the report.
+    #[arg(long)]
+    pub ort_profile: Option<PathBuf>,
+
+    /// ONNX Runtime session log level. Also needs `ORT_LOG` in the environment.
+    #[arg(long, value_enum)]
+    pub ort_log: Option<OrtLogArg>,
+
+    /// Pin a free graph dimension, e.g. `--dim-override seq_len=512`.
+    ///
+    /// Repeatable. Applies to graph inputs only; computed output dimensions are
+    /// not free dimensions and cannot be set. GLiNER2 pads to match.
+    #[arg(long, value_parser = parse_dim_override)]
+    pub dim_override: Vec<(String, i64)>,
+}
+
+fn parse_dim_override(s: &str) -> std::result::Result<(String, i64), String> {
+    let (name, size) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected name=size, got {s:?}"))?;
+    let size: i64 = size
+        .trim()
+        .parse()
+        .map_err(|_| format!("{size:?} is not an integer"))?;
+    if size <= 0 {
+        return Err(format!("dimension {name} must be positive, got {size}"));
+    }
+    Ok((name.trim().to_owned(), size))
 }
 
 impl DetectorArgs {
@@ -302,13 +434,26 @@ pub struct PerfArgs {
     #[arg(long, default_value_t = 3)]
     pub warmup: usize,
 
-    /// Thread counts for the throughput measurement. Empty to skip.
-    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 2, 4, 8])]
+    /// Thread counts for the throughput measurement.
+    ///
+    /// Pass the flag with no values (`--thread-counts`) to skip throughput
+    /// entirely. A latency-only run matters for the CoreML profiling cells:
+    /// each throughput worker opens its own session, and each session with
+    /// `--ort-profile` writes its own profile file.
+    #[arg(long, value_delimiter = ',', num_args = 0.., default_values_t = [1usize, 2, 4, 8])]
     pub thread_counts: Vec<usize>,
 
     /// Documents per thread in the throughput measurement.
     #[arg(long, default_value_t = 20)]
     pub throughput_docs: usize,
+
+    /// Also attribute latency to tokenize / inference / decode stages.
+    ///
+    /// Runs a second, instrumented pass after the headline measurement, so the
+    /// reported percentiles above stay uninstrumented. Errors out on a detector
+    /// that does not implement it rather than printing a table of zeros.
+    #[arg(long)]
+    pub stage_timing: bool,
 
     #[arg(long, short)]
     pub output: Option<PathBuf>,

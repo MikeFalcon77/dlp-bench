@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use tokenizers::Tokenizer;
 
-use super::onnx::{ExecutionProviderChoice, GraphContract, GraphInput, OrtGraph, ThreadConfig};
+use super::onnx::{GraphContract, GraphInput, OrtGraph, SessionOptions, ThreadConfig};
 use super::token_class::{ModelVariant, Precision};
 use super::words::Word;
 use crate::detector::{ArtifactInfo, Detector, finish};
@@ -163,7 +163,8 @@ pub struct Gliner1Config {
     /// The model card recommends 0.3, not 0.5.
     pub threshold: f32,
     pub threads: ThreadConfig,
-    pub provider: ExecutionProviderChoice,
+    /// How the ONNX Runtime session is built. Defaults to the CPU baseline.
+    pub session: SessionOptions,
     pub schema: &'static LabelMap,
     pub verify_checksum: bool,
     pub max_width: usize,
@@ -178,7 +179,7 @@ impl Gliner1Config {
             precision: None,
             threshold: 0.3,
             threads: ThreadConfig::default(),
-            provider: ExecutionProviderChoice::default(),
+            session: SessionOptions::default(),
             schema: &crate::labels::GLINER1_PII,
             verify_checksum: true,
             // From gliner_config.json for both checkpoints.
@@ -267,7 +268,8 @@ impl Gliner1Detector {
             .map_err(|e| DetectorError::Tokenizer(format!("{}: {e}", tokenizer_path.display())))?;
         prompt::assert_special_tokens(&tokenizer)?;
 
-        let graph = OrtGraph::load_with(&model_path, &CONTRACT, config.threads, config.provider)?;
+        let graph =
+            OrtGraph::load_with_options(&model_path, &CONTRACT, config.threads, &config.session)?;
         let name = format!("{}-{}", config.model.id, variant.precision.as_str());
         let labels = config.schema.labels();
 
@@ -465,6 +467,10 @@ impl Detector for Gliner1Detector {
 
     fn model_size_bytes(&self) -> Option<u64> {
         Some(self.variant.size_bytes)
+    }
+
+    fn runtime_info(&self) -> Option<crate::runtime::RuntimeInfo> {
+        Some(self.inner.lock().ok()?.graph.runtime_info())
     }
 
     /// GLiNER1 pays a per-call label prompt just as GLiNER2 does, though a
