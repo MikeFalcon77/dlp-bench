@@ -58,43 +58,7 @@ an agent; the benchmark is a consumer of them, not the other way round.
 `cargo build --no-default-features` drops `ort` and `tokenizers` entirely and still builds the
 deterministic detector and the full evaluator — useful for CI without a 446 MB download.
 
-## 3. How `quarry-models` is reused
-
-The task called for reusing `/Users/mike/projects/quarry/crates/quarry-models`. We inspected it
-first. The finding that drove the decision:
-
-> **`quarry-models` contains no ONNX inference code.** There is no `Session`, no `SessionBuilder`,
-> no tensor construction, no `tokenizers` usage, no offset handling and no span decoding anywhere
-> in the crate. It depends on `ort` solely to hand execution-provider handles to `fastembed`, which
-> owns every session. Its only real NER path is an out-of-workspace sidecar binary
-> (`apps/quarry-ner-gliner`) pinned to a *different, incompatible* ORT (rc.9 vs the crate's rc.12)
-> and driven over stdin/stdout JSON-RPC.
-
-So there was no inference layer to reuse. What the crate genuinely owns, we **adapted with
-attribution** rather than depended on:
-
-| Taken from | Adapted into |
-|---|---|
-| `assets/hub-models.toml` + `src/download.rs` + `src/hash.rs` — pinned-revision manifest with per-file sha256 and size verification | `scripts/fetch-models.sh`, and the load-time `verify_sha256` in `detectors/gliner2/mod.rs` |
-| `src/execution_providers.rs` — explicit EP selection with a recorded configuration | `detectors/onnx.rs` (CPU by default, CoreML opt-in) |
-| `src/error.rs` — `thiserror` enum + per-crate `Result` alias | `src/error.rs` |
-| `tracing` conventions — structured fields, lowercase messages, no subscriber in the library | throughout; subscriber installed only in `main.rs`, writing to stderr |
-
-A cargo dependency was rejected for concrete reasons, not preference:
-
-- the crate is `publish = false` and requires `quarry-core`, `quarry-config` and
-  `quarry-ner-protocol`, which drags Quarry's `AppPaths`/`ModelManifest` application-config model
-  into a standalone benchmark in a different repository;
-- its model registry is `include_str!`-baked into the crate, so adding a PII model would mean
-  editing Quarry's source from here;
-- its `ort` pin (rc.12) conflicts with what we need, and nothing would be shared in return.
-
-One divergence worth noting for anyone moving code between the two: `quarry-ner-protocol` uses
-**Unicode scalar (char) offsets**; this crate uses **UTF-8 byte offsets** throughout. `span.rs`
-provides `char_to_byte` / `char_to_byte_table` for the conversion. Do not pass one where the other
-is expected.
-
-## 4. Supported detectors
+## 3. Supported detectors
 
 | id | what it is | status |
 |---|---|---|
@@ -107,7 +71,7 @@ is expected.
 | `nvidia-gliner-pii` | `nvidia/gliner-PII` | not started |
 | `hybrid` | deterministic ∪ best ML, with span merging and conflict resolution | Phase 2 |
 
-## 5. Canonical taxonomy
+## 4. Canonical taxonomy
 
 Twenty types in `src/entity.rs`, serialised as stable `SCREAMING_SNAKE_CASE`:
 
@@ -132,7 +96,7 @@ gold span, which the one-to-one matcher then scores as 1 TP and N−1 FP: a prec
 schema, not a property of the model. The full 42-label schema is available as `--schema full` for
 the latency-vs-schema-size measurement, where quality is not being scored.
 
-## 6. Obtaining the model files
+## 5. Obtaining the model files
 
 ```bash
 bash scripts/fetch-models.sh
@@ -152,7 +116,7 @@ bash scripts/fetch-models.sh minilm-l6-pii
 The GLiNER2 artifact is `yethdev/gliner2-pii-onnx` @ `7d82c702…`, 446,391,629 bytes, sha256
 `489edc52…`. See §12 for what we do and do not know about its provenance.
 
-## 7. Preparing datasets
+## 6. Preparing datasets
 
 Internal format is JSONL with **UTF-8 byte offsets**:
 
@@ -196,7 +160,7 @@ allowed to know a foreign schema or offset convention:
 Results from each are reported **separately**, never pooled: they ask different questions, and
 several candidate models have training-data proximity to the public ones.
 
-## 8. Running a quality evaluation
+## 7. Running a quality evaluation
 
 ```bash
 cargo build --release
@@ -218,7 +182,7 @@ cargo build --release
 Useful flags: `--restrict-to-supported` (score only the types the schema can produce),
 `--adversarial`, `--schema minimal|default|full`, `--ip-policy ignore|report`.
 
-## 9. Running a threshold sweep
+## 8. Running a threshold sweep
 
 ```bash
 ./target/release/dlp-bench sweep \
@@ -235,7 +199,7 @@ character recall and false positives per 1,000 documents. `--csv` also writes a 
 `calibration_warning` into the JSON when run against a `test` set. It does not refuse — sometimes
 you want the test-set curve for a report — but an accidental leak is visible rather than silent.
 
-## 10. Running a performance benchmark
+## 9. Running a performance benchmark
 
 ```bash
 ./target/release/dlp-bench perf \
@@ -314,7 +278,7 @@ question, not a runtime one, and belongs to whoever owns the export.
 Adding CUDA, DirectML or OpenVINO later is one more arm in `providers()` in
 `detectors/gliner2/graph.rs` plus one `ort` feature; nothing else in the crate is affected.
 
-## 11. Interpreting the metrics
+## 10. Interpreting the metrics
 
 **High recall matters most for DLP.** A missed credit card is an incident. Recall is reported
 overall, per entity, and separately for a configurable **critical group** (`NATIONAL_ID`,
@@ -780,7 +744,7 @@ p95 <= 50 ms @ ~128 tokens    p95 <= 150 ms @ ~512 tokens
 warm RSS <= 750 MB            cold start <= 2 s
 ```
 
-## 12. Known limitations
+## 11. Known limitations
 
 **The ONNX export is community-produced and unverified.** `yethdev/gliner2-pii-onnx` is an
 unaffiliated export of Fastino's model with 0 downloads at the time of writing. Its card claims
@@ -830,7 +794,7 @@ more entry in the array in `graph.rs`). Peak RSS is process-wide. The fixture da
 `BANK_ACCOUNT` and `URL` have no coverage in the current fixtures. Windows peak-RSS is not
 implemented, and reports `null` rather than an approximation.
 
-## 13. Development
+## 12. Development
 
 ```bash
 cargo fmt --all
