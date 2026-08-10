@@ -1,0 +1,19 @@
+# dlp-dev — calibration/development split. Choose thresholds here, not on dlp-v1.
+# Offsets are UTF-8 bytes. Regenerate with scripts/gen_fixtures.py.
+{"id": "dev-ai-001", "source": "custom", "language": "ja", "text": "Draft a reply to Hiroshi Tanaka <hiroshi@example.jp> about billing.", "entities": [{"type": "PERSON", "start": 17, "end": 31}, {"type": "EMAIL", "start": 33, "end": 51}], "tags": ["ai_prompt"]}
+{"id": "dev-cfg-001", "source": "custom", "language": "en", "text": "REDIS_URL=redis://cache:Sup3rSecret@redis.internal:6379/0", "entities": [{"type": "CONNECTION_STRING", "start": 10, "end": 57}], "tags": ["config"]}
+{"id": "dev-fin-001", "source": "custom", "language": "en", "text": "Charge the card 5500 0055 5555 5559, IBAN NL91ABNA0417164300.", "entities": [{"type": "CREDIT_CARD", "start": 16, "end": 35}, {"type": "IBAN", "start": 42, "end": 60}], "tags": ["prose"]}
+{"id": "dev-json-001", "source": "custom", "language": "en", "text": "{\"contact\": {\"email\": \"ops@example.net\", \"ip\": \"198.51.100.7\"}}", "entities": [{"type": "EMAIL", "start": 23, "end": 38}, {"type": "IP_ADDRESS", "start": 48, "end": 60}], "tags": ["json"]}
+{"id": "dev-log-001", "source": "custom", "language": "en", "text": "2026-07-01 user=ops@example.net ip=198.51.100.7 action=export", "entities": [{"type": "EMAIL", "start": 16, "end": 31}, {"type": "IP_ADDRESS", "start": 35, "end": 47}], "tags": ["log"]}
+{"id": "dev-ml-001", "source": "custom", "language": "ru", "text": "Ольга Смирнова написала на olga@example.ru вчера.", "entities": [{"type": "PERSON", "start": 0, "end": 27}, {"type": "EMAIL", "start": 50, "end": 65}], "tags": ["prose"]}
+{"id": "dev-neg-001", "source": "custom", "language": "en", "text": "Ticket #9912 closed after 3 retries.", "entities": [], "tags": ["prose", "negative"]}
+{"id": "dev-neg-002", "source": "custom", "language": "en", "text": "Release 2.14.0-rc.3 published at 2026-07-01T09:00:00Z.", "entities": [], "tags": ["log", "negative"]}
+{"id": "dev-neg-003", "source": "custom", "language": "en", "text": "Correlation id 7f3e9b21-4c5d-4a7e-9f01-2b3c4d5e6f70", "entities": [], "tags": ["log", "negative"]}
+{"id": "dev-neg-004", "source": "custom", "language": "en", "text": "Bind to 0.0.0.0:3000 for local development.", "entities": [], "tags": ["config", "negative"]}
+{"id": "dev-neg-005", "source": "custom", "language": "en", "text": "MD5 checksum d41d8cd98f00b204e9800998ecf8427e verified.", "entities": [], "tags": ["log", "negative"]}
+{"id": "dev-neg-006", "source": "custom", "language": "en", "text": "Array indices 1111, 2222, 3333, 4444 were skipped.", "entities": [], "tags": ["source_code", "negative"]}
+{"id": "dev-nl-001", "source": "custom", "language": "en", "text": "Reach out to Emily Watson at emily.watson@example.org.", "entities": [{"type": "PERSON", "start": 13, "end": 25}, {"type": "EMAIL", "start": 29, "end": 53}], "tags": ["prose"]}
+{"id": "dev-nl-002", "source": "custom", "language": "en", "text": "His passport is P9988776 and he was born on 1979-11-02.", "entities": [{"type": "PASSPORT", "start": 16, "end": 24}, {"type": "DATE_OF_BIRTH", "start": 44, "end": 54}], "tags": ["prose"]}
+{"id": "dev-nl-003", "source": "custom", "language": "pl", "text": "Ring Tomasz Nowak on +48 601 234 567 tomorrow.", "entities": [{"type": "PERSON", "start": 5, "end": 17}, {"type": "PHONE", "start": 21, "end": 36}], "tags": ["prose"]}
+{"id": "dev-sql-001", "source": "custom", "language": "en", "text": "UPDATE staff SET phone='+44 20 7946 0958' WHERE name='Alan Turing';", "entities": [{"type": "PHONE", "start": 24, "end": 40}, {"type": "PERSON", "start": 54, "end": 65}], "tags": ["sql"]}
+{"id": "dev-yaml-001", "source": "custom", "language": "de", "text": "app:\n  owner: Lena Fischer\n  token: ghp_a1B2c3D4e5a1B2c3D4e5a1B2c3D4e5aaaaaa", "entities": [{"type": "PERSON", "start": 14, "end": 26}, {"type": "ACCESS_TOKEN", "start": 36, "end": 76}], "tags": ["yaml"]}

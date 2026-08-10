@@ -1,0 +1,64 @@
+[package]
+name = "dlp-bench"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Reproducible benchmark for local PII detection models targeting endpoint DLP / AI gateways"
+
+[lib]
+name = "dlp_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dlp-bench"
+path = "src/main.rs"
+
+[features]
+# ONNX-backed detectors. On by default; disable for a pure-Rust build that only
+# exercises the deterministic detector and the evaluator (useful in CI without
+# a 446 MB model download).
+default = ["onnx", "coreml"]
+onnx = ["dep:ort", "dep:tokenizers"]
+# Apple CoreML execution provider. ONNX Runtime has no Metal EP; on Apple
+# silicon CoreML is the route to the GPU and Neural Engine, and it decides
+# per-subgraph where each operator runs. Opt-in at runtime via `--ep coreml`;
+# CPU remains the default so the baseline comparison stays honest.
+coreml = ["ort?/coreml"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+sha2 = "0.10"
+smallvec = "1"
+memory-stats = "1.2"
+
+# ONNX runtime. Pinned exactly: rc-to-rc API churn is real (`Session::run` moved
+# to `&mut self` in rc.10, `try_extract_*` reshaped), and a benchmark must pin
+# its runtime to be reproducible. CPU execution provider only in Phase 1.
+# `tls-native` is required alongside `download-binaries`: the two are separate
+# features, and `download-binaries` on its own leaves `ort-sys`'s build script
+# without a TLS backend and fails to compile. Uses the platform trust store,
+# which matters here because this machine's PyPI path is TLS-intercepted.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "download-binaries",
+    "tls-native",
+    "copy-dylibs",
+], optional = true }
+tokenizers = { version = "0.23", default-features = false, features = [
+    "onig",
+], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+panic = "unwind"
+debug = "line-tables-only"
