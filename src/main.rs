@@ -18,11 +18,15 @@ use dlp_bench::perf::{self, PerfConfig};
 use dlp_bench::report::{AcceptanceTargets, Report, print_summary};
 use dlp_bench::runmeta::RunMeta;
 
-use cli::{Cli, Command, DetectorArgs, DetectorKind, EpArg, IpPolicy, PrecisionArg, RoleArg};
+use cli::{
+    BackendArg, Cli, Command, DetectorArgs, DetectorKind, DeviceArg, EpArg, IpPolicy, PrecisionArg,
+    RoleArg,
+};
 
 fn main() {
     let cli = Cli::parse();
     init_tracing(&cli.log);
+    size_candle_gemm(&cli);
 
     if let Err(e) = run(&cli) {
         eprintln!("\nerror: {e}");
@@ -46,11 +50,42 @@ fn init_tracing(level: &str) {
         .try_init();
 }
 
+/// Make Candle's matmuls split across as many threads as the detector's pool.
+///
+/// Candle runs every CPU op on the rayon pool it is called from, but sizes the
+/// `gemm` split from `RAYON_NUM_THREADS` (else the performance-core count),
+/// not from that pool. With `--threads 8` on a 6-performance-core M5 Pro that
+/// left two pool threads idle in every matmul, which is 80% of the work:
+/// matching the two was worth ~17% of p50. An explicit `RAYON_NUM_THREADS`
+/// in the environment wins.
+fn size_candle_gemm(cli: &Cli) {
+    let a = match &cli.command {
+        Command::Evaluate(a) => &a.detector,
+        Command::Sweep(a) => &a.detector,
+        Command::Perf(a) => &a.detector,
+        Command::Concurrency(a) => &a.detector,
+        Command::Inspect(a) => &a.detector,
+        Command::Import(_) => return,
+    };
+    let cpu =
+        a.backend == BackendArg::Candle && a.device.unwrap_or(DeviceArg::Cpu) == DeviceArg::Cpu;
+    if !cpu || std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        return;
+    }
+    let threads = a
+        .threads
+        .unwrap_or_else(|| dlp_bench::runtime::ThreadConfig::default().intra_op);
+    // SAFETY: called from `main` before any thread is spawned, so nothing can
+    // be reading the environment concurrently.
+    unsafe { std::env::set_var("RAYON_NUM_THREADS", threads.to_string()) };
+}
+
 fn run(cli: &Cli) -> Result<()> {
     match &cli.command {
         Command::Evaluate(a) => cmd_evaluate(cli, a),
         Command::Sweep(a) => cmd_sweep(cli, a),
         Command::Perf(a) => cmd_perf(cli, a),
+        Command::Concurrency(a) => cmd_concurrency(cli, a),
         Command::Inspect(a) => cmd_inspect(cli, a),
         Command::Import(a) => cmd_import(cli, a),
     }
@@ -117,6 +152,7 @@ fn cmd_import(cli: &Cli, a: &cli::ImportArgs) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn build_detector(a: &DetectorArgs) -> Result<Box<dyn Detector>> {
+    check_backend(a)?;
     match a.detector {
         DetectorKind::Deterministic => {
             Ok(Box::new(DeterministicDetector::new(DeterministicConfig {
@@ -158,6 +194,67 @@ fn build_detector(a: &DetectorArgs) -> Result<Box<dyn Detector>> {
                 Err(onnx_disabled(a.detector.as_str()))
             }
         }
+    }
+}
+
+/// Reject backend/device combinations that would silently measure something
+/// other than what was asked for.
+///
+/// Every ONNX Runtime knob is meaningless under Candle, and a result labelled
+/// `candle` that quietly ran with `--ep coreml` ignored is exactly the kind of
+/// row that later gets compared against the wrong baseline.
+fn check_backend(a: &DetectorArgs) -> Result<()> {
+    match a.backend {
+        BackendArg::Ort => {
+            if a.device.is_some() {
+                return Err(Error::config(
+                    "--device selects a Candle device; under --backend ort use --ep".to_owned(),
+                ));
+            }
+        }
+        BackendArg::Candle => {
+            if a.detector != DetectorKind::Gliner2Pii {
+                return Err(Error::config(format!(
+                    "--backend candle is implemented for gliner2-pii only, not {}",
+                    a.detector.as_str()
+                )));
+            }
+            let r = &a.runtime;
+            let ort_flag = a.ep != EpArg::Cpu
+                || r.coreml_format.is_some()
+                || r.coreml_compute_units.is_some()
+                || r.coreml_subgraphs.is_some()
+                || r.coreml_static_shapes.is_some()
+                || r.coreml_specialization.is_some()
+                || r.coreml_profile
+                || r.coreml_cache_dir.is_some()
+                || r.coreml_fp16_accum.is_some()
+                || r.disable_cpu_fallback
+                || r.no_intra_op_spinning
+                || r.ort_profile.is_some()
+                || r.ort_log.is_some()
+                || !r.dim_override.is_empty();
+            if ort_flag {
+                return Err(Error::config(
+                    "--ep and the ONNX Runtime flags have no effect under --backend candle; \
+                     use --device cpu|metal"
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "onnx")]
+fn backend(a: &DetectorArgs) -> dlp_bench::runtime::Backend {
+    use dlp_bench::runtime::{Backend, CandleDevice};
+    match a.backend {
+        BackendArg::Ort => Backend::Ort,
+        BackendArg::Candle => Backend::Candle(match a.device.unwrap_or(DeviceArg::Cpu) {
+            DeviceArg::Cpu => CandleDevice::Cpu,
+            DeviceArg::Metal => CandleDevice::Metal,
+        }),
     }
 }
 
@@ -425,6 +522,7 @@ fn build_gliner2(a: &DetectorArgs) -> Result<dlp_bench::detectors::gliner2::Glin
     cfg.schema = schema;
     cfg.verify_checksum = !a.skip_checksum;
     cfg.session = session_options(a)?;
+    cfg.backend = backend(a);
     // Derived from the same overrides the session gets, so the two cannot
     // disagree; `Gliner2Detector::load` re-checks and refuses if they do.
     cfg.fixed_shape = fixed_shape(&cfg.session)?;
@@ -667,10 +765,67 @@ fn cmd_perf(cli: &Cli, a: &cli::PerfArgs) -> Result<()> {
             buckets,
             stage_breakdown,
             throughput,
+            concurrency: Vec::new(),
             warm_rss,
             peak_rss: perf::memory::snapshot(),
             iterations: cfg.iterations,
             warmup: cfg.warmup,
+        }),
+        sweep: None,
+        acceptance: vec![],
+    };
+    report.check_acceptance(AcceptanceTargets::default());
+    emit(&report, a.output.as_deref())
+}
+
+// ---------------------------------------------------------------------------
+// concurrency
+// ---------------------------------------------------------------------------
+
+fn cmd_concurrency(cli: &Cli, a: &cli::ConcurrencyArgs) -> Result<()> {
+    let budget = a
+        .detector
+        .threads
+        .unwrap_or_else(|| dlp_bench::runtime::ThreadConfig::default().intra_op);
+    let cfg = perf::concurrency::ConcurrencyConfig {
+        clients: a.clients.clone(),
+        docs: a.docs.clone(),
+        requests_per_client: a.requests_per_client,
+        pool_max: a.pool_max,
+        thread_budget: budget,
+    };
+    let build = |threads: usize| {
+        let args = DetectorArgs {
+            threads: Some(threads),
+            ..a.detector.clone()
+        };
+        build_detector(&args).map_err(|e| match e {
+            Error::Detector { source, .. } => *source,
+            other => dlp_bench::DetectorError::config(other.to_string()),
+        })
+    };
+    let run = perf::concurrency::measure(&build, &cfg)
+        .map_err(|source| Error::detector(a.detector.detector.as_str(), source))?;
+    let d = &run.last;
+
+    let mut report = Report {
+        run: RunMeta::capture(cli.seed),
+        artifacts: d.artifact_info(),
+        quality: None,
+        performance: Some(dlp_bench::perf::PerfReport {
+            detector: d.name().to_owned(),
+            model_size_bytes: d.model_size_bytes(),
+            schema_prefix_tokens: d.fixed_prompt_tokens(),
+            runtime: d.runtime_info(),
+            cold_start: run.cold_start,
+            buckets: Vec::new(),
+            stage_breakdown: Vec::new(),
+            throughput: Vec::new(),
+            concurrency: run.points,
+            warm_rss: perf::memory::snapshot(),
+            peak_rss: perf::memory::snapshot(),
+            iterations: a.requests_per_client,
+            warmup: 1,
         }),
         sweep: None,
         acceptance: vec![],

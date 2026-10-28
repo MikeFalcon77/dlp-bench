@@ -71,6 +71,46 @@ impl ThreadConfig {
     }
 }
 
+/// Which inference library runs a token classifier.
+///
+/// Orthogonal to [`ExecutionProviderChoice`], which only means anything under
+/// ONNX Runtime. Candle reads the same ONNX weight file, so switching backend
+/// changes the runtime and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    #[default]
+    Ort,
+    Candle(CandleDevice),
+}
+
+/// Where Candle runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandleDevice {
+    #[default]
+    Cpu,
+    /// Apple GPU. The accelerator ONNX Runtime cannot reach directly.
+    Metal,
+}
+
+impl CandleDevice {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CandleDevice::Cpu => "cpu",
+            CandleDevice::Metal => "metal",
+        }
+    }
+
+    /// Whether this build can actually honour the request.
+    pub fn is_available(self) -> bool {
+        match self {
+            CandleDevice::Cpu => cfg!(feature = "candle"),
+            CandleDevice::Metal => cfg!(all(feature = "metal", target_os = "macos")),
+        }
+    }
+}
+
 /// Which ONNX Runtime execution provider to use.
 ///
 /// ONNX Runtime has **no Metal execution provider**. On Apple silicon the route

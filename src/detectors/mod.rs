@@ -28,3 +28,8 @@ pub mod gliner2;
 /// Generic BIO token-classification detector.
 #[cfg(feature = "onnx")]
 pub mod token_class;
+
+/// Candle backend for the token classifiers: same ONNX weight file, a
+/// different runtime, and the only route here to the Apple GPU via Metal.
+#[cfg(feature = "candle")]
+pub mod candle;

@@ -101,6 +101,16 @@ pub trait Detector: Send + Sync {
     fn fixed_prompt_tokens(&self) -> Option<usize> {
         None
     }
+
+    /// Whether one instance runs concurrent `detect` calls in parallel rather
+    /// than serialising them on an internal lock.
+    ///
+    /// The concurrency benchmark serves N clients from one shared instance
+    /// when this is `true`, and from a pool of instances otherwise — sharing a
+    /// serialising detector would measure its lock, not the runtime.
+    fn concurrent_detect(&self) -> bool {
+        false
+    }
 }
 
 /// Boxed detectors are detectors.
@@ -147,6 +157,9 @@ impl<T: Detector + ?Sized> Detector for Box<T> {
     }
     fn fixed_prompt_tokens(&self) -> Option<usize> {
         (**self).fixed_prompt_tokens()
+    }
+    fn concurrent_detect(&self) -> bool {
+        (**self).concurrent_detect()
     }
 }
 

@@ -1,0 +1,8 @@
+# Reference PyTorch engine for the gliner2-pii runtime comparison
+# (scripts/bench_pytorch_gliner2.py). Python 3.14.
+#
+# torch 2.14.1 rather than 2.15.0: the latter was published on the day this was
+# pinned. The full resolved set is recorded per run in out/runtimes/.
+torch==2.14.1
+gliner2[local]==2.1.0
+psutil==7.2.2
