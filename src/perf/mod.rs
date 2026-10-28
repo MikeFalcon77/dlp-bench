@@ -13,6 +13,7 @@
 //! Model loading, dataset parsing, JSON serialization and logging all happen
 //! outside the timed region.
 
+pub mod concurrency;
 pub mod latency;
 pub mod memory;
 
@@ -168,6 +169,9 @@ pub struct PerfReport {
     pub stage_breakdown: Vec<StageBreakdown>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub throughput: Vec<ThroughputPoint>,
+    /// N clients sharing one service; filled by `dlp-bench concurrency`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub concurrency: Vec<concurrency::ConcurrencyPoint>,
     pub warm_rss: Option<MemorySnapshot>,
     pub peak_rss: Option<MemorySnapshot>,
     pub iterations: usize,

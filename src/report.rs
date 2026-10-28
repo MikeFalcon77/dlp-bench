@@ -584,16 +584,18 @@ fn print_perf(w: &mut impl Write, p: &PerfReport) -> std::io::Result<()> {
         writeln!(w, "  peak RSS (process)    {} MB", r / 1_048_576)?;
     }
 
-    writeln!(
-        w,
-        "\n  warm latency ({} iterations after {} warm-up):",
-        p.iterations, p.warmup
-    )?;
-    writeln!(
-        w,
-        "    {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9}",
-        "tokens", "words", "p50 ms", "p90 ms", "p95 ms", "p99 ms", "max ms", "docs/s"
-    )?;
+    if !p.buckets.is_empty() {
+        writeln!(
+            w,
+            "\n  warm latency ({} iterations after {} warm-up):",
+            p.iterations, p.warmup
+        )?;
+        writeln!(
+            w,
+            "    {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9}",
+            "tokens", "words", "p50 ms", "p90 ms", "p95 ms", "p99 ms", "max ms", "docs/s"
+        )?;
+    }
     for b in &p.buckets {
         let q = &b.percentiles;
         writeln!(
@@ -611,6 +613,8 @@ fn print_perf(w: &mut impl Write, p: &PerfReport) -> std::io::Result<()> {
     }
 
     print_stage_breakdown(w, p)?;
+
+    print_concurrency(w, p)?;
 
     if !p.throughput.is_empty() {
         writeln!(w, "\n  throughput (independent detector per thread):")?;
@@ -631,6 +635,43 @@ fn print_perf(w: &mut impl Write, p: &PerfReport) -> std::io::Result<()> {
                     .map_or_else(|| "-".to_owned(), |r| r.rss_mb.to_string())
             )?;
         }
+    }
+    Ok(())
+}
+
+fn print_concurrency(w: &mut impl Write, p: &PerfReport) -> std::io::Result<()> {
+    let Some(first) = p.concurrency.first() else {
+        return Ok(());
+    };
+    writeln!(
+        w,
+        "\n  concurrency ({}; latency as the client sees it, queueing included):",
+        if first.shared {
+            "one shared instance"
+        } else {
+            "pool of instances, thread budget split"
+        }
+    )?;
+    writeln!(
+        w,
+        "    {:>7} {:>7} {:>9} {:>8} {:>9} {:>9} {:>9} {:>8}",
+        "tokens", "clients", "instances", "req/s", "p50 ms", "p95 ms", "p99 ms", "RSS MB"
+    )?;
+    for c in &p.concurrency {
+        writeln!(
+            w,
+            "    {:>7} {:>7} {:>6} x{:<2} {:>8.2} {:>9.1} {:>9.1} {:>9.1} {:>8}",
+            c.target_tokens,
+            c.clients,
+            c.instances,
+            c.threads_per_instance,
+            c.requests_per_sec,
+            c.latency.p50_ms,
+            c.latency.p95_ms,
+            c.latency.p99_ms,
+            c.rss
+                .map_or_else(|| "-".to_owned(), |r| r.rss_mb.to_string())
+        )?;
     }
     Ok(())
 }
@@ -730,6 +771,7 @@ mod tests {
             }],
             stage_breakdown: vec![],
             throughput: vec![],
+            concurrency: vec![],
             warm_rss: None,
             peak_rss: None,
             iterations: 10,

@@ -23,6 +23,16 @@ MANIFEST=(
   "gliner2-pii-onnx|yethdev/gliner2-pii-onnx|7d82c70220c2b0891d4bda612402602b63be1c61|tokenizer_config.json|tokenizer_config.json|233beed1f1095cccfc7907cde31a8d90a0c6aa4fdfaf6493f8e55fd162e81ae6|711"
   "gliner2-pii-onnx|yethdev/gliner2-pii-onnx|7d82c70220c2b0891d4bda612402602b63be1c61|export_info.json|export_info.json||"
 
+  # The original PyTorch checkpoint the ONNX export above was made from — fp32
+  # weights, run by the reference `gliner2` engine for the runtime comparison
+  # (scripts/bench_pytorch_gliner2.py). Its tokenizer.json is byte-identical
+  # to the export's, so all three runtimes see the same token ids.
+  "gliner2-pii-pytorch|fastino/gliner2-privacy-filter-PII-multi|1cb4166094dc58fa8d836429f060d6c95f62b495|model.safetensors|model.safetensors|0280f6f39f6012da50b6640bad438d9b7e763a1b0102094115d1b710c4dd79b6|1228421964"
+  "gliner2-pii-pytorch|fastino/gliner2-privacy-filter-PII-multi|1cb4166094dc58fa8d836429f060d6c95f62b495|tokenizer.json|tokenizer.json|f6df10ec83bea993035b2dd7c39345a3d4fcf23421c2adb6cb4ffc1e6d1bc4b5|16020604"
+  "gliner2-pii-pytorch|fastino/gliner2-privacy-filter-PII-multi|1cb4166094dc58fa8d836429f060d6c95f62b495|tokenizer_config.json|tokenizer_config.json||"
+  "gliner2-pii-pytorch|fastino/gliner2-privacy-filter-PII-multi|1cb4166094dc58fa8d836429f060d6c95f62b495|config.json|config.json||"
+  "gliner2-pii-pytorch|fastino/gliner2-privacy-filter-PII-multi|1cb4166094dc58fa8d836429f060d6c95f62b495|encoder_config/config.json|encoder_config/config.json||"
+
   # ai4privacy/OpenPII token classifier on the same mdeberta-v3-base backbone as
   # GLiNER2 — the controlled comparison for "does a plain token classifier beat
   # zero-shot span extraction on latency". 111 BIO labels over 56 entity types.
@@ -93,7 +103,7 @@ for row in "${MANIFEST[@]}"; do
 
   dest="$MODELS_DIR/$dir"
   out="$dest/$name"
-  mkdir -p "$dest"
+  mkdir -p "$(dirname "$out")"
 
   if [[ -f "$out" && -n "$sha" ]]; then
     if [[ "$(sha256_of "$out")" == "$sha" ]]; then

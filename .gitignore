@@ -2,3 +2,5 @@
 /models
 /out
 *.part
+.cache/
+.venv-pytorch/

@@ -33,11 +33,14 @@ use std::sync::{Arc, Mutex};
 use tokenizers::Tokenizer;
 
 use self::prompt::{EncodedInput, PromptPrefix, WordIdCache};
-use super::onnx::{GraphContract, GraphInput, OrtGraph, SessionOptions, ThreadConfig};
+#[cfg(feature = "candle")]
+use super::candle::gliner2::Gliner2Candle;
+use super::onnx::{GraphContract, GraphInput, OrtGraph, SessionOptions, TensorOut, ThreadConfig};
 use crate::detector::{ArtifactInfo, Detector, finish};
 use crate::entity::{Detection, DetectionSource};
 use crate::error::DetectorError;
 use crate::labels::LabelMap;
+use crate::runtime::Backend;
 use crate::stages::{Stage, StageTimer};
 
 /// Artifact file names inside the model directory.
@@ -82,6 +85,9 @@ pub struct Gliner2Config {
     pub fixed_shape: Option<prompt::FixedShape>,
     /// Which label schema to condition on. Also the mapping to canonical types.
     pub schema: &'static LabelMap,
+    /// Which library runs the graph. Candle rebuilds it from the same ONNX
+    /// file; prompt construction and decoding are shared either way.
+    pub backend: Backend,
     /// Verify the model file's sha256 at load.
     ///
     /// On by default: benchmarking an unverified artifact produces numbers
@@ -98,21 +104,21 @@ impl Gliner2Config {
             session: SessionOptions::default(),
             fixed_shape: None,
             schema: &crate::labels::GLINER2_PII,
+            backend: Backend::Ort,
             verify_checksum: true,
         }
     }
 }
 
 pub struct Gliner2Detector {
-    /// `Mutex` so the detector satisfies `Detector::detect(&self)` while
-    /// `Session::run` needs `&mut`. For the throughput benchmark we build N
-    /// independent detectors rather than sharing one, which measures real
-    /// per-thread scaling and exposes the N x RSS cost honestly.
-    ///
     /// `Arc` so a threshold sweep can produce a re-tuned view without reloading
     /// 446 MB of weights per sweep point — the threshold is a decode-time
-    /// parameter, so the session and prefix are genuinely shared.
-    inner: Arc<Mutex<Inner>>,
+    /// parameter, so the engine and prefix are genuinely shared.
+    engine: Arc<Engine>,
+    /// Tokenizer and word cache, locked only while one document is encoded so
+    /// that concurrent callers of a concurrency-capable engine do not queue
+    /// behind each other's inference.
+    prep: Arc<Mutex<Prep>>,
     prefix: Arc<PromptPrefix>,
     config: Gliner2Config,
     name: String,
@@ -120,11 +126,70 @@ pub struct Gliner2Detector {
     tokenizer_path: PathBuf,
 }
 
-struct Inner {
-    graph: OrtGraph,
+struct Prep {
     tokenizer: Tokenizer,
     cache: WordIdCache,
-    enc: EncodedInput,
+}
+
+/// What turns an encoded prompt into `(span_probs, count_logits)`.
+enum Engine {
+    /// `Mutex` because `Session::run` needs `&mut`: `ort` refuses concurrent
+    /// runs on one session, since parts of ONNX Runtime (some EP allocators,
+    /// statistics) are not thread-safe. Concurrency means one session per
+    /// worker, which is what the throughput and concurrency benchmarks build.
+    Ort(Mutex<OrtGraph>),
+    /// No lock: the model is immutable after load and its forward pass takes
+    /// `&self`, so one loaded copy serves any number of threads.
+    #[cfg(feature = "candle")]
+    Candle(Box<Gliner2Candle>),
+}
+
+impl Engine {
+    fn run(
+        &self,
+        enc: &EncodedInput,
+        prefix: &PromptPrefix,
+        timer: &mut StageTimer,
+    ) -> Result<(TensorOut, TensorOut), DetectorError> {
+        match self {
+            Engine::Ort(graph) => {
+                let mut graph = graph.lock().map_err(|_| {
+                    DetectorError::inference("gliner2 session mutex poisoned by a previous panic")
+                })?;
+                let mut outputs = graph.run_i64_timed(
+                    &[
+                        GraphInput::batched("input_ids", &enc.input_ids),
+                        GraphInput::batched("attention_mask", &enc.attention_mask),
+                        GraphInput::flat("text_word_indices", &enc.text_word_indices),
+                        GraphInput::flat("schema_special_indices", &prefix.schema_special_indices),
+                    ],
+                    CONTRACT.outputs,
+                    timer,
+                )?;
+                let count = outputs.pop().expect("contract guarantees two outputs");
+                let spans = outputs.pop().expect("contract guarantees two outputs");
+                Ok((spans, count))
+            }
+            #[cfg(feature = "candle")]
+            Engine::Candle(model) => {
+                let t_in = timer.start();
+                let mut t_run = None;
+                let out = model.run(
+                    &enc.input_ids,
+                    &enc.text_word_indices,
+                    &prefix.schema_special_indices,
+                    &mut || {
+                        timer.record(Stage::InputCopy, t_in);
+                        t_run = timer.start();
+                    },
+                );
+                // Readback is inside the run: Candle has no separate output
+                // copy to attribute.
+                timer.record(Stage::SessionRun, t_run);
+                out
+            }
+        }
+    }
 }
 
 impl Gliner2Detector {
@@ -161,21 +226,30 @@ impl Gliner2Detector {
 
         let prefix = prompt::build_prefix(&tokenizer, &config.schema.labels())?;
         assert_fixed_shape_matches_overrides(&config, prefix.num_labels)?;
-        let graph =
-            OrtGraph::load_with_options(&model_path, &CONTRACT, config.threads, &config.session)?;
+        let engine = match config.backend {
+            Backend::Ort => Engine::Ort(Mutex::new(OrtGraph::load_with_options(
+                &model_path,
+                &CONTRACT,
+                config.threads,
+                &config.session,
+            )?)),
+            Backend::Candle(device) => load_candle(&config, &model_path, device)?,
+        };
 
-        let name = if config.schema.model() == "gliner2-pii" {
+        let mut name = if config.schema.model() == "gliner2-pii" {
             "gliner2-pii".to_owned()
         } else {
             format!("gliner2-pii[{}]", config.schema.model())
         };
+        if let Backend::Candle(device) = config.backend {
+            name = format!("{name}-candle-{}", device.as_str());
+        }
 
         Ok(Self {
-            inner: Arc::new(Mutex::new(Inner {
-                graph,
+            engine: Arc::new(engine),
+            prep: Arc::new(Mutex::new(Prep {
                 tokenizer,
                 cache: WordIdCache::new(50_000),
-                enc: EncodedInput::default(),
             })),
             prefix: Arc::new(prefix),
             config,
@@ -200,7 +274,11 @@ impl Gliner2Detector {
 
     /// ONNX graph I/O description, for `dlp-bench inspect`.
     pub fn describe_graph(&self) -> String {
-        self.inner.lock().expect("gliner2 mutex").graph.describe()
+        match &*self.engine {
+            Engine::Ort(graph) => graph.lock().expect("gliner2 mutex").describe(),
+            #[cfg(feature = "candle")]
+            Engine::Candle(model) => model.describe(),
+        }
     }
 
     /// Encoder input sizes for `text`, before any padding.
@@ -210,18 +288,27 @@ impl Gliner2Detector {
     /// whitespace words and SentencePiece pieces.
     pub fn encoded_size(&self, text: &str) -> Result<(usize, usize), DetectorError> {
         let prepared = words::prepare(text);
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| DetectorError::inference("gliner2 session mutex poisoned"))?;
-        let Inner {
-            tokenizer,
-            cache,
-            enc,
-            ..
-        } = &mut *inner;
-        prompt::build_input(&self.prefix, &prepared.words, tokenizer, cache, None, enc)?;
+        let enc = self.encode(&prepared.words, None)?;
         Ok((enc.real_seq_len, enc.real_num_words))
+    }
+
+    /// Encoder input for `words`, holding the tokenizer lock only for this.
+    ///
+    /// A fresh buffer per call rather than a reused one: under concurrent
+    /// callers a shared buffer would extend the lock over inference, and the
+    /// allocation is a few hundred integers.
+    fn encode(
+        &self,
+        words: &[words::Word],
+        pad: Option<prompt::FixedShape>,
+    ) -> Result<EncodedInput, DetectorError> {
+        let mut prep = self.prep.lock().map_err(|_| {
+            DetectorError::inference("gliner2 tokenizer mutex poisoned by a previous panic")
+        })?;
+        let Prep { tokenizer, cache } = &mut *prep;
+        let mut enc = EncodedInput::default();
+        prompt::build_input(&self.prefix, words, tokenizer, cache, pad, &mut enc)?;
+        Ok(enc)
     }
 
     /// Raw `(span_probs, count_logits)` for `text`, optionally right-padded.
@@ -239,44 +326,53 @@ impl Gliner2Detector {
         &self,
         text: &str,
         pad: Option<prompt::FixedShape>,
-    ) -> Result<(super::onnx::TensorOut, super::onnx::TensorOut), DetectorError> {
+    ) -> Result<(TensorOut, TensorOut), DetectorError> {
         let prepared = words::prepare(text);
         if prepared.words.is_empty() {
             return Err(DetectorError::inference("no words to encode"));
         }
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| DetectorError::inference("gliner2 session mutex poisoned"))?;
-        let Inner {
-            graph,
-            tokenizer,
-            cache,
-            enc,
-        } = &mut *inner;
-
-        prompt::build_input(&self.prefix, &prepared.words, tokenizer, cache, pad, enc)?;
-        let mut outputs = graph.run_i64(
-            &[
-                GraphInput::batched("input_ids", &enc.input_ids),
-                GraphInput::batched("attention_mask", &enc.attention_mask),
-                GraphInput::flat("text_word_indices", &enc.text_word_indices),
-                GraphInput::flat(
-                    "schema_special_indices",
-                    &self.prefix.schema_special_indices,
-                ),
-            ],
-            CONTRACT.outputs,
-        )?;
-        let count = outputs.pop().expect("contract guarantees two outputs");
-        let spans = outputs.pop().expect("contract guarantees two outputs");
-        Ok((spans, count))
+        let enc = self.encode(&prepared.words, pad)?;
+        self.engine
+            .run(&enc, &self.prefix, &mut StageTimer::disabled())
     }
 
     /// Words `text` segments into, for sizing a `raw_outputs` comparison.
     pub fn word_count(&self, text: &str) -> usize {
         words::prepare(text).words.len()
     }
+}
+
+#[cfg(feature = "candle")]
+fn load_candle(
+    config: &Gliner2Config,
+    model_path: &Path,
+    device: crate::runtime::CandleDevice,
+) -> Result<Engine, DetectorError> {
+    // Padding is a static-shape experiment for ONNX Runtime's CoreML EP; the
+    // Candle path runs unpadded and builds no attention mask.
+    if config.fixed_shape.is_some() {
+        return Err(DetectorError::config(
+            "fixed-shape padding is an ONNX Runtime experiment; the candle backend runs unpadded"
+                .to_owned(),
+        ));
+    }
+    Ok(Engine::Candle(Box::new(Gliner2Candle::load(
+        model_path,
+        device,
+        config.threads,
+    )?)))
+}
+
+#[cfg(not(feature = "candle"))]
+fn load_candle(
+    _: &Gliner2Config,
+    _: &Path,
+    _: crate::runtime::CandleDevice,
+) -> Result<Engine, DetectorError> {
+    Err(DetectorError::config(
+        "the candle backend is not compiled into this binary; rebuild with --features candle"
+            .to_owned(),
+    ))
 }
 
 /// Refuse a config whose padding and dimension overrides disagree.
@@ -387,46 +483,16 @@ impl Detector for Gliner2Detector {
             return Ok(Vec::new());
         }
 
-        // Deliberately outside every stage: for the single-threaded latency
-        // measurement this is uncontended and free, and under the throughput
-        // benchmark each worker owns its own detector, so a mutex cost here
-        // would mean something has gone wrong rather than something worth
-        // attributing. It shows up as unattributed if it ever does.
-        let mut inner = self.inner.lock().map_err(|_| {
-            DetectorError::inference("gliner2 session mutex poisoned by a previous panic")
-        })?;
-        let Inner {
-            graph,
-            tokenizer,
-            cache,
-            enc,
-        } = &mut *inner;
-
+        // Lock waits land in Tokenize (the tokenizer lock) and SessionRun (the
+        // ORT session lock). Both are uncontended in the single-caller latency
+        // measurement; under concurrent callers the wait is part of what a
+        // caller pays, so it belongs in the number.
         let t_tok = timer.start();
-        prompt::build_input(
-            &self.prefix,
-            &prepared.words,
-            tokenizer,
-            cache,
-            self.config.fixed_shape,
-            enc,
-        )?;
+        let enc = self.encode(&prepared.words, self.config.fixed_shape)?;
         timer.record(Stage::Tokenize, t_tok);
 
-        let outputs = graph.run_i64_timed(
-            &[
-                GraphInput::batched("input_ids", &enc.input_ids),
-                GraphInput::batched("attention_mask", &enc.attention_mask),
-                GraphInput::flat("text_word_indices", &enc.text_word_indices),
-                GraphInput::flat(
-                    "schema_special_indices",
-                    &self.prefix.schema_special_indices,
-                ),
-            ],
-            CONTRACT.outputs,
-            timer,
-        )?;
-        let (span_probs, count_logits) = (&outputs[0], &outputs[1]);
+        let (span_probs, count_logits) = self.engine.run(&enc, &self.prefix, timer)?;
+        let (span_probs, count_logits) = (&span_probs, &count_logits);
 
         let t_decode = timer.start();
         let dims = decode::SpanDims::from_tensor(span_probs).ok_or_else(|| {
@@ -513,7 +579,8 @@ impl Detector for Gliner2Detector {
         let mut config = self.config.clone();
         config.threshold = threshold;
         Some(Box::new(Self {
-            inner: Arc::clone(&self.inner),
+            engine: Arc::clone(&self.engine),
+            prep: Arc::clone(&self.prep),
             prefix: Arc::clone(&self.prefix),
             config,
             name: self.name.clone(),
@@ -550,11 +617,23 @@ impl Detector for Gliner2Detector {
     }
 
     fn runtime_info(&self) -> Option<crate::runtime::RuntimeInfo> {
-        Some(self.inner.lock().ok()?.graph.runtime_info())
+        match &*self.engine {
+            Engine::Ort(graph) => Some(graph.lock().ok()?.runtime_info()),
+            #[cfg(feature = "candle")]
+            Engine::Candle(model) => Some(model.runtime_info()),
+        }
     }
 
     fn fixed_prompt_tokens(&self) -> Option<usize> {
         Some(self.prefix.len())
+    }
+
+    fn concurrent_detect(&self) -> bool {
+        match &*self.engine {
+            Engine::Ort(_) => false,
+            #[cfg(feature = "candle")]
+            Engine::Candle(_) => true,
+        }
     }
 }
 
@@ -589,6 +668,62 @@ mod tests {
             a[0].revision.as_deref() != Some("main"),
             "revision must be pinned"
         );
+    }
+
+    /// **The claim the Candle backend rests on**: the same file, rebuilt as a
+    /// Candle network, reproduces the graph's own outputs.
+    ///
+    /// Raw tensors rather than decoded spans, for the reason `raw_outputs`
+    /// gives: a threshold hides drift, and the count gate is all-or-nothing.
+    /// Every `(word, width, label)` cell is compared — including the spans
+    /// that run past the text, which the export rewrites to `(0, 0)` and so
+    /// probe that rewrite too.
+    #[cfg(feature = "candle")]
+    #[test]
+    fn candle_reproduces_the_onnx_graph_outputs() {
+        let Some(ort) = detector(0.5) else { return };
+        let mut cfg = Gliner2Config::new(MODEL_DIR);
+        cfg.verify_checksum = false;
+        cfg.backend = Backend::Candle(crate::runtime::CandleDevice::Cpu);
+        let candle = Gliner2Detector::load(cfg).expect("candle must load the same file");
+        assert_eq!(candle.name(), "gliner2-pii-candle-cpu");
+
+        // The long document puts token distances past 128, where DeBERTa's
+        // log-bucketed relative positions start, and past 512, where they clamp.
+        let long = crate::perf::synthetic_document(300);
+        for text in [
+            "Contact John Smith at john@example.com or +1 415 555 0100.",
+            "Свяжитесь с Михаил Ястребцов, IBAN DE89 3704 0044 0532 0130 00",
+            "version 1.2.3 released, see issue #4411",
+            "postgres://admin:s3cretpw99@prod-db.internal:5432/app",
+            long.as_str(),
+        ] {
+            let (a_spans, a_count) = ort.raw_outputs(text, None).unwrap();
+            let (b_spans, b_count) = candle.raw_outputs(text, None).unwrap();
+            assert_eq!(a_spans.shape, b_spans.shape, "{text:?}");
+            assert_eq!(a_count.shape, b_count.shape, "{text:?}");
+            let max = |a: &[f32], b: &[f32]| {
+                a.iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max)
+            };
+            let dp = max(&a_spans.data, &b_spans.data);
+            let dc = max(&a_count.data, &b_count.data);
+            assert!(dp < 1e-3, "span_probs differ by {dp} on {text:?}");
+            assert!(dc < 1e-2, "count_logits differ by {dc} on {text:?}");
+
+            let strip = |d: Vec<Detection>| {
+                d.into_iter()
+                    .map(|x| (x.entity_type, x.start, x.end))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                strip(ort.detect(text).unwrap()),
+                strip(candle.detect(text).unwrap()),
+                "{text:?}"
+            );
+        }
     }
 
     #[test]

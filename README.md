@@ -35,6 +35,10 @@ detectors/
   onnx.rs                           ALL `ort` types; one runtime, one thread pool,
                                     one optimisation level for every model
   words.rs                          Word (byte offsets) + splitter plumbing
+  candle/                           ALL `candle_*` types; gliner2-pii rebuilt from its ONNX file
+    onnx_weights.rs  initializers -> named tensors (fp16 widened, int8 kept)
+    deberta.rs       mdeberta-v3 encoder: unmasked, fused disentangled attention on CPU
+    gliner2.rs       span/count/GRU head on top, same outputs as the graph
   deterministic/                    pattern -> validator -> Detection
     recognizer.rs, validators.rs, patterns/{contact,financial,secrets}.rs
   token_class/                      generic BIO token classifiers
@@ -277,6 +281,151 @@ question, not a runtime one, and belongs to whoever owns the export.
 
 Adding CUDA, DirectML or OpenVINO later is one more arm in `providers()` in
 `detectors/gliner2/graph.rs` plus one `ort` feature; nothing else in the crate is affected.
+
+### gliner2-pii on three runtimes: ONNX Runtime, Candle, PyTorch
+
+`gliner2-pii` also runs on [Candle](https://github.com/huggingface/candle) (`--backend candle
+--device cpu|metal`), rebuilt from the **same ONNX file** ONNX Runtime loads: fp16 weights are
+widened exactly, the int8 word table is dequantized per row after the gather as the graph does,
+and the GLiNER2 head (span marker, count gate, one GRU step, projector) is reimplemented from the
+export's nodes. Tokenisation, prompt and decoding are shared with the ORT path, and
+`candle_reproduces_the_onnx_graph_outputs` holds every `span_probs` cell within 1e-3 of ORT.
+Candle on Metal needs `--features metal`; `--features accelerate` routes Candle's CPU matmuls
+through Apple Accelerate.
+
+The reference is the upstream PyTorch engine (`gliner2` 2.1.0, torch 2.14.1, Python 3.14) on
+the original fp32 checkpoint, `scripts/fetch-models.sh gliner2-pii-pytorch`. Its tokenizer is
+byte-identical to the export's, and on the same text it returns the same spans with the same
+scores as ORT and Candle.
+
+```bash
+bash scripts/bench-runtimes.sh          # six configurations, strictly sequential
+python3 scripts/collate-runtimes.py
+```
+
+Apple M5 Pro, 48 GB. Same synthetic documents (the collator refuses buckets whose bytes
+differ), same 17-label schema, threshold 0.5, 8 intra-op threads, 30 iterations after 3
+warm-ups. Timed region is text → entities, tokenisation and decoding included. p50 latency, with
+speed-up against ONNX Runtime CPU in brackets:
+
+| runtime | load | 1st call | 32 tok (42 w) | 128 tok (132 w) | 512 tok (522 w) | 1024 tok (1031 w) |
+|---|---:|---:|---:|---:|---:|---:|
+| ONNX Runtime, CPU | 535 ms | 59 ms | 60 ms | 167 ms | 853 ms | 2412 ms |
+| Candle, CPU (gemm) | 412 ms | 378 ms | 379 ms (0.16×) | 1052 ms (0.16×) | 7682 ms (0.11×) | 25490 ms (0.09×) |
+| Candle, CPU (Accelerate) | 437 ms | 270 ms | 235 ms (0.26×) | 791 ms (0.21×) | 6582 ms (0.13×) | 22741 ms (0.11×) |
+| Candle, Metal | 420 ms | 148 ms | 41 ms (1.49×) | 121 ms (1.38×) | 1129 ms (0.76×) | 3857 ms (0.63×) |
+| PyTorch, CPU | 4157 ms | 121 ms | 79 ms (0.77×) | 153 ms (1.09×) | 739 ms (1.15×) | 2130 ms (1.13×) |
+| **PyTorch, MPS** | 4010 ms | 287 ms | **27 ms (2.22×)** | **78 ms (2.12×)** | **713 ms (1.20×)** | 2554 ms (0.94×) |
+
+The Candle rows were measured with `candle-transformers`' DeBERTa-v2, before the encoder
+rewrite described in the next section; the current CPU numbers are there.
+
+p95 is within 5% of p50 everywhere. PyTorch's load excludes a further ~2.2–2.4 s of
+`import torch`. Rust loads ran with `--skip-checksum`, because the PyTorch loader does not hash
+its weights.
+
+How to read it:
+
+- **PyTorch MPS is the fastest configuration for prompt-sized input**, about 2.2× ORT on CPU up
+  to 128 tokens. Past 512 tokens its advantage fades, and at 1024 it is slightly behind.
+- **Candle on Metal beats ORT only on short input** (1.4–1.5×) and stays ~1.5× behind PyTorch
+  MPS throughout. The gap widens with length, which points at Candle's DeBERTa-v2
+  disentangled-attention ops rather than its matmuls.
+- **Candle on CPU is not competitive**, 4–11× slower than ORT. Accelerate helps only marginally,
+  so the matmuls are not the bottleneck there either.
+- **PyTorch on CPU is level with ORT** (0.8–1.15×), but pays ~4 s to load plus ~2.3 s to import
+  — about 12× ORT's cold start.
+
+Caveats. ORT and Candle run the community fp16/int8-compressed export, and PyTorch runs the
+original fp32 weights. Compute is fp32 in all three, so speed is comparable, but the weights are
+not bit-identical. Accelerate manages its own threads and ignores `--threads`. On Metal/MPS the
+memory is unified, so process RSS does not show GPU buffers, and the "RSS" columns in
+`out/runtimes/*.json` are not comparable across CPU and GPU rows.
+
+### gliner2-pii on CPU under concurrent clients
+
+The product runs on Linux VMs, so this pass is **CPU only**. It is built without the macOS-only
+paths: Candle is the pure-Rust `gemm` build, with neither `accelerate` nor `metal`.
+
+```bash
+bash scripts/bench-cpu.sh out/cpu-macos       # latency, then N = 1..10 clients
+python3 scripts/collate-runtimes.py out/cpu-macos
+```
+
+`dlp-bench concurrency` runs N closed-loop clients, released together by a barrier. Latency is
+measured as the client sees it, including any wait for a free model. The service has a fixed
+budget of 8 threads:
+
+- **ONNX Runtime** gets a pool of `min(N, 2)` sessions, with the budget split between them
+  (1 × 8 threads, then 2 × 4). `ort` forbids concurrent runs on one session, and holding more
+  than two ~1.5 GB copies was ruled out. Waiting clients are served first come, first served.
+- **Candle** serves every client from one shared model with no lock: its forward pass is
+  `&self`. Its DeBERTa encoder is this crate's own (`detectors/candle/deberta.rs`, see below).
+- **PyTorch** uses one shared model and N Python threads. torch releases the GIL inside its
+  kernels.
+
+Apple M5 Pro. Single request, p50 (speed-up against ORT):
+
+| | 32 tok | 128 tok | 512 tok |
+|---|---:|---:|---:|
+| ONNX Runtime | 60 ms | 148 ms | 824 ms |
+| Candle (own encoder) | 122 ms (0.49×) | 267 ms (0.55×) | 1167 ms (0.71×) |
+| PyTorch | 81 ms (0.74×) | 159 ms (0.93×) | 729 ms (1.13×) |
+
+Under load, 20 timed requests per client per level. Each cell is req/s | p95 ms:
+
+| 32 tok (42 words) | N=1 | N=2 | N=4 | N=6 | N=8 | N=10 |
+|---|---:|---:|---:|---:|---:|---:|
+| ONNX Runtime (pool ≤ 2) | 14.1 \| 74 | 21.4 \| 104 | 22.0 \| 192 | 21.9 \| 285 | 21.7 \| 382 | 22.4 \| 472 |
+| Candle (shared) | 7.9 \| 131 | 8.4 \| 359 | 8.7 \| 1442 | 8.5 \| 2204 | 8.8 \| 2652 | 8.8 \| 3422 |
+| PyTorch (shared) | 12.4 \| 82 | 16.5 \| 129 | 25.1 \| 199 | 27.5 \| 277 | 26.3 \| 317 | 27.0 \| 397 |
+
+| 128 tok (132 words) | N=1 | N=2 | N=4 | N=6 | N=8 | N=10 |
+|---|---:|---:|---:|---:|---:|---:|
+| ONNX Runtime (pool ≤ 2) | 6.1 \| 171 | 8.8 \| 241 | 8.7 \| 479 | 8.8 \| 711 | 8.8 \| 948 | 8.4 \| 1378 |
+| Candle (shared) | 3.7 \| 279 | 3.7 \| 864 | 3.8 \| 2952 | 3.8 \| 3993 | 3.9 \| 5328 | 3.9 \| 7937 |
+| PyTorch (shared) | 6.4 \| 164 | 9.0 \| 229 | 12.2 \| 401 | 10.7 \| 580 | 12.7 \| 655 | 12.9 \| 816 |
+
+RSS across the levels: ORT 1.8 → 3.0 GB (one session, then two), PyTorch 1.9–2.8 GB, Candle
+1.3–1.7 GB.
+
+- **ORT stops scaling at N=2**, at ~22 req/s (32 tok) and ~8.8 req/s (128 tok). Its throughput is
+  set by the two-session cap, so beyond that every extra client adds a full queue slot to the
+  latency.
+- **PyTorch on one model keeps scaling to N≈4–6** and plateaus 1.2–1.5× above capped ORT, with a
+  lower p95 at high N.
+- **Candle gains nothing from concurrency.** One request already occupies the whole 8-thread
+  pool, so throughput is flat at 1/latency (~8.7 and ~3.8 req/s), about 0.4× ORT. Concurrent
+  forward passes then interleave on that pool in no order, so the tail is far worse than a queue
+  would give (p95 7.9 s at N=10, 128 tok). Serialising requests through a FIFO would keep the
+  same throughput and bound p95 near N × the single-call latency.
+
+**Candle's encoder.** `candle-transformers`' DeBERTa-v2 spent 54% of a CPU forward pass in
+single-threaded `where_cond` inside `XSoftmax`, masking with an all-ones mask, plus 13% building
+that mask, 10% in gathers, 7% in single-threaded `erf`, and 2.6% in matmuls.
+`detectors/candle/deberta.rs` replaces it with the same arithmetic:
+
+- no mask on unpadded input;
+- relative-position projections computed once at load, with the scale folded in;
+- Q, K and V in one matmul;
+- on CPU, one parallel pass doing both gathers, the add and the softmax, plus a parallel GELU
+  that is bit-identical to `gelu_erf`;
+- Candle's `gemm` split matched to `--threads`.
+
+That is 3–6× faster than before (362 → 122 ms at 32 tokens, 7.7 → 1.2 s at 512).
+`candle_reproduces_the_onnx_graph_outputs` still holds every `span_probs` cell within 1e-3 of
+ONNX Runtime, now including a ~1100-token document that exercises log-bucketed and clamped
+positions. 80% of the remaining time is in the `gemm` crate's matmul kernels, so the gap to ORT
+is now a matmul-kernel gap: ORT uses its own MLAS kernels. On x86 Linux, Candle's `mkl` feature
+is the next lever.
+
+**Transfer to a Linux VM.** Relative order is the point of this table, and one cell is
+flattered. PyTorch on macOS links Apple Accelerate for BLAS, which runs on the CPU's AMX/SME matrix
+unit. A Linux VM has no such unit: torch there uses MKL/oneDNN (x86) or OpenBLAS (ARM). Expect
+PyTorch's lead over ORT to shrink or reverse on the VM. ORT (MLAS) and Candle (`gemm`) use their
+own kernels on both systems. A process-level check confirms the PyTorch-CPU run never touched the
+GPU: every parameter is on `cpu`, the MPS allocator holds 0 bytes, and the process kept ~2 cores
+busy.
 
 ## 10. Interpreting the metrics
 

@@ -39,6 +39,8 @@ pub enum Command {
     Sweep(SweepArgs),
     /// Measure cold start, warm latency, throughput and memory.
     Perf(PerfArgs),
+    /// Simulate N clients sending requests to one service at once.
+    Concurrency(ConcurrencyArgs),
     /// Show what is loaded: detector configuration, graph I/O, dataset stats.
     Inspect(InspectArgs),
     /// Convert a third-party corpus into the benchmark's JSONL format.
@@ -118,6 +120,23 @@ impl DetectorKind {
             DetectorKind::Gliner1PiiSmall => "gliner1-pii-small",
         }
     }
+}
+
+/// Inference library for gliner2-pii.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendArg {
+    /// ONNX Runtime (default, and every number in the README).
+    Ort,
+    /// Candle, reading the same ONNX weight file.
+    Candle,
+}
+
+/// Where Candle runs.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceArg {
+    Cpu,
+    /// Apple GPU. Needs a build with `--features metal`.
+    Metal,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,6 +245,15 @@ pub struct DetectorArgs {
     /// Execution provider. CPU is the baseline; compare before switching.
     #[arg(long, value_enum, default_value = "cpu")]
     pub ep: EpArg,
+
+    /// Inference library. `candle` runs the same ONNX weight file without ONNX
+    /// Runtime; implemented for gliner2-pii.
+    #[arg(long, value_enum, default_value = "ort")]
+    pub backend: BackendArg,
+
+    /// Candle device. Only meaningful with `--backend candle`.
+    #[arg(long, value_enum)]
+    pub device: Option<DeviceArg>,
 
     /// Weight precision. Defaults per model; an error if unavailable.
     #[arg(long, value_enum)]
@@ -460,6 +488,34 @@ pub struct PerfArgs {
 }
 
 #[derive(clap::Args, Debug, Clone)]
+pub struct ConcurrencyArgs {
+    /// `--threads` is the CPU budget for the whole service, split across a
+    /// pool when the detector cannot serve concurrent calls from one instance.
+    #[command(flatten)]
+    pub detector: DetectorArgs,
+
+    /// Concurrent client counts. Each client sends, waits, and sends again.
+    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 10])]
+    pub clients: Vec<usize>,
+
+    /// Request sizes in approximate whitespace tokens, one series each.
+    #[arg(long, value_delimiter = ',', default_values_t = [32usize, 128])]
+    pub docs: Vec<usize>,
+
+    /// Timed requests per client at each level.
+    #[arg(long, default_value_t = 20)]
+    pub requests_per_client: usize,
+
+    /// Most instances a pool may hold at once (detectors that cannot share
+    /// one instance, e.g. ONNX Runtime). Each is a full copy of the model.
+    #[arg(long, default_value_t = 2)]
+    pub pool_max: usize,
+
+    #[arg(long, short)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug, Clone)]
 pub struct InspectArgs {
     #[command(flatten)]
     pub detector: DetectorArgs,
@@ -613,6 +669,37 @@ mod tests {
             panic!()
         };
         assert_eq!(a.detector.ep, EpArg::Coreml);
+    }
+
+    #[test]
+    fn backend_defaults_to_ort_and_accepts_candle_on_metal() {
+        let c = Cli::try_parse_from(["dlp-bench", "perf", "--detector", "gliner2-pii"]).unwrap();
+        let Command::Perf(a) = c.command else {
+            panic!()
+        };
+        assert_eq!(
+            a.detector.backend,
+            BackendArg::Ort,
+            "ORT stays the baseline"
+        );
+        assert_eq!(a.detector.device, None);
+
+        let c = Cli::try_parse_from([
+            "dlp-bench",
+            "perf",
+            "--detector",
+            "gliner2-pii",
+            "--backend",
+            "candle",
+            "--device",
+            "metal",
+        ])
+        .unwrap();
+        let Command::Perf(a) = c.command else {
+            panic!()
+        };
+        assert_eq!(a.detector.backend, BackendArg::Candle);
+        assert_eq!(a.detector.device, Some(DeviceArg::Metal));
     }
 
     #[test]
